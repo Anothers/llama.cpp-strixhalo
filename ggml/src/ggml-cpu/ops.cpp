@@ -12136,6 +12136,9 @@ void ggml_compute_forward_lightning_indexer(
 
     for (int s = 0; s < n_stream; ++s) {
         for (int t = 0; t < n_tokens; ++t) {
+            const ggml_tensor * lim = dst->src[4];
+    const int32_t * lim_d = lim ? (const int32_t *) lim->data : nullptr;
+    const int32_t   lim_t = lim ? ggml_get_op_params_i32(dst, 1) : 0;
             const float       *   w_row = w ?       (float *) ((char *)   w->data + t*nbw1 +        s*nbw3) : nullptr;
             const ggml_fp16_t *   m_row = m ? (ggml_fp16_t *) ((char *)   m->data + t*nbm1 + (s%nem3)*nbm3) : nullptr;
             float             * dst_row =       (float *) ((char *) dst->data + t*nb1  +        s*nb3 );
@@ -12157,6 +12160,7 @@ void ggml_compute_forward_lightning_indexer(
                 }
                 // apply mask
                 dst_row[ik] = score + (m_row ? GGML_CPU_FP16_TO_FP32(m_row[ik]) : 0.0f);
+                if (lim_d && !(lim_d[lim_t + t] > lim_d[ik])) { dst_row[ik] = -INFINITY; }
             }
         }
     }

@@ -1178,6 +1178,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
                 n_kv, n_query, 1, n_stream, kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], first*kq_mask->nb[1]);
 
         ggml_tensor * score = nullptr;
+        bool fused_visibility = false;
         // [QSA_FUSED_INDEXER] sum_h relu(q_h . k) in one pass: the fused lightning-indexer kernel keeps a tile of block
         // keys in registers and walks the query rows, so the [blocks, heads, queries] f32 product is never written out.
         // Unfused, that product is ~6.5 GB per layer at 200K context and dominates long-context prefill.
@@ -1188,7 +1189,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
                     q->nb[1], q->nb[2], q->nb[2]*n_tps, first*q->nb[2]);
             ggml_tensor * k4 = ggml_view_4d(ctx0, score_keys, idx_dim, 1, score_blocks, n_stream,
                     score_keys->nb[1], score_keys->nb[1], score_keys->nb[2], 0);
-            score = ggml_lightning_indexer(ctx0, q4, k4, nullptr, nullptr);
+            if (inp->compact && n_stream == 1) {
+                // [QSA_FUSED_VISIBILITY] the compact visibility (block start < query bound, else -inf) is applied in the
+                // kernel epilogue instead of repeat/sub/step/log/add passes over the whole [blocks, queries] score
+                score = ggml_lightning_indexer_limits(ctx0, q4, k4, nullptr, inp->bias, n_blocks + first);
+                fused_visibility = true;
+            } else {
+                score = ggml_lightning_indexer(ctx0, q4, k4, nullptr, nullptr);
+            }
             score = ggml_reshape_3d(ctx0, score, score_blocks, n_query, n_stream);
         } else {
         // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
@@ -1211,7 +1219,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         cb(score, "indexer_score", il);
 
         // one value per block, so it is cheaper to bias here than after the cells are expanded
-        if (inp->compact) {
+        if (fused_visibility) {
+            // already applied by the indexer kernel
+        } else if (inp->compact) {
             score = qwen4exp_apply_compact_visibility(ctx0,score,inp->bias,n_blocks,first,n_query);
         } else if (blk_bias) {
             score = ggml_add(ctx0, score, bias);

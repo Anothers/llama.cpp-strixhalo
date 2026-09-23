@@ -2677,6 +2677,17 @@ extern "C" {
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask);
 
+    // lightning indexer with block visibility from integer limits instead of a mask (single stream):
+    //   limits: I32, limits[key] = first position of block `key`, limits[tail_offset + token] = the query's visible bound
+    //   res[key, token] = score, or -inf unless limits[tail_offset + token] > limits[key]
+    GGML_API struct ggml_tensor * ggml_lightning_indexer_limits(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * limits,
+        int64_t               tail_offset);
+
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
     // In short these operations are replacements for the original residual connection (x = transformer(x) + x)
     // using a richer representation through streams.

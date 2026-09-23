@@ -6459,6 +6459,23 @@ struct ggml_tensor * ggml_lightning_indexer(
     return result;
 }
 
+struct ggml_tensor * ggml_lightning_indexer_limits(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * limits,
+        int64_t               tail_offset) {
+    GGML_ASSERT(limits && limits->type == GGML_TYPE_I32 && ggml_is_contiguous(limits));
+    GGML_ASSERT(q->ne[3] == 1);
+    GGML_ASSERT(ggml_nelements(limits) >= tail_offset + q->ne[2] && ggml_nelements(limits) >= k->ne[2]);
+    struct ggml_tensor * result = ggml_lightning_indexer(ctx, q, k, weights, NULL);
+    result->src[4] = limits;
+    const int32_t params[2] = { 1, (int32_t) tail_offset };
+    ggml_set_op_params(result, params, sizeof(params));
+    return result;
+}
+
 // ggml_dsv4_hc_comb
 
 struct ggml_tensor * ggml_dsv4_hc_comb(
