@@ -647,6 +647,24 @@ bool   mmb_shadow()    { return mmb_shadow_mode() != 0; }
 bool   mmb_shadow_q6k(){ return mmb_shadow_mode() >= 1; }
 size_t mmb_shadow_cap(){ return (size_t) 6144 << 20; }
 static bool mmb_is_resident_q6k(const ggml_tensor * w) { return w && w->type == GGML_TYPE_Q6_K && w->op == GGML_OP_NONE && w->data && w->buffer && w->ne[2] == 1 && w->ne[3] == 1 && ggml_is_contiguous(w) && w->ne[0] % 256 == 0 && w->ne[1] <= 32768; }
+// tall Q8_0 (HC down: 320 x 10240): its dense tile reuses each dequantized weight for only 64 tokens, so the
+// Q8_0 decode dominates; a bf16 copy (6.5 MB each) moves it off the GEMM. LLAMA_MMB_SHADOW_Q8TALL=0 disables.
+static bool mmb_is_tall_q8(const ggml_tensor * w) {
+    static const bool on = [] { const char * e = getenv("LLAMA_MMB_SHADOW_Q8TALL"); return !e || atoi(e) != 0; }();
+    return on && w && w->type == GGML_TYPE_Q8_0 && w->op == GGML_OP_NONE && w->data && w->buffer && w->ne[2] == 1 && w->ne[3] == 1 &&
+           ggml_is_contiguous(w) && w->ne[1] <= 384 && w->ne[0] >= 4096 && w->ne[0] % 64 == 0;
+}
+static __global__ void mmb_dq_q8_0_bf16_kernel(const uint8_t * __restrict__ src, uint16_t * __restrict__ dst, const size_t nblocks) {
+    const size_t b = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= nblocks) return;
+    const uint8_t * blk = src + b * 34;
+    const float d = (float) __builtin_bit_cast(_Float16, (uint16_t) (blk[0] | (blk[1] << 8)));
+    for (int i = 0; i < 32; ++i) {
+        const float v = d * (float) (int8_t) blk[2 + i];
+        const uint32_t u = __float_as_uint(v);
+        dst[b * 32 + i] = (uint16_t) ((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);   // round to nearest even
+    }
+}
 static bool mmb_is_resident_iq4(const ggml_tensor * w) { return w && w->type == GGML_TYPE_IQ4_NL && w->op == GGML_OP_NONE && w->data && w->buffer && w->ne[2] == 1 && w->ne[3] == 1 && ggml_is_contiguous(w); }
 static bool mmb_is_row_concat(const ggml_tensor * w) {
     return w && w->op == GGML_OP_CONCAT && w->type == GGML_TYPE_IQ4_NL && ggml_get_op_params_i32(w, 0) == 1 && mmb_is_resident_iq4(w->src[0]) && mmb_is_resident_iq4(w->src[1]) &&
@@ -757,7 +775,11 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     static const bool tall_q8 = [] { const char * e = getenv("LLAMA_MMB_TALL_Q8"); return !e || atoi(e) != 0; }();
     if (mmb_tall() && (src0->type == GGML_TYPE_IQ4_NL || (tall_q8 && src0->type == GGML_TYPE_Q8_0)) && M <= 384 && K >= 4096 && T >= 2048) {
         static const int wide = mmb_tall_mode() >= 2;
-        if (src0->type == GGML_TYPE_Q8_0) {
+        const uint16_t * tall_shadow = src0->type == GGML_TYPE_Q8_0 ? mmb_shadow_lookup(src0) : nullptr;
+        if (tall_shadow && wide) {
+            dim3 grid(1, (T + 63) / 64);
+            mmb_dense_kernel<384, 64, 96, 32, 2><<<grid, MMB_NT, 0, stream>>>((const uint8_t *) tall_shadow, xhp, D, (uint16_t *) nullptr, true, M, K, T);
+        } else if (src0->type == GGML_TYPE_Q8_0) {
             if (wide) { dim3 grid(1, (T + 63) / 64); mmb_dense_kernel<384, 64, 96, 32, 1><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, (uint16_t *) nullptr, true, M, K, T); }
             else      { dim3 grid(1, (T + 31) / 32); mmb_dense_kernel<384, 32, 96, 16, 1><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, (uint16_t *) nullptr, true, M, K, T); }
         } else {
@@ -920,6 +942,18 @@ void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_te
         uint16_t * buf = nullptr;
         if (cudaMalloc((void **) &buf, bytes) != cudaSuccess) { GGML_LOG_WARN("MMB_SHADOW alloc failed (%zu bytes)\n", bytes); return; }
         mmb_dq_q6k_bf16_kernel<<<(unsigned) ((n / 256 + 255) / 256), 256, 0, ctx.stream()>>>((const uint8_t *) w->data, buf, n / 256);
+        CUDA_CHECK(cudaGetLastError());
+        g_mmb_shadow[w->data] = buf; g_mmb_shadow_bytes += bytes;
+        return;
+    }
+    if (mmb_is_tall_q8(w)) {
+        if (g_mmb_shadow.count(w->data) > 0) return;
+        const size_t n = (size_t) w->ne[0] * w->ne[1], bytes = n * 2;
+        if (g_mmb_shadow_bytes + bytes > mmb_shadow_cap()) { return; }
+        uint16_t * buf = nullptr;
+        if (cudaMalloc((void **) &buf, bytes) != cudaSuccess) { GGML_LOG_WARN("MMB_SHADOW alloc failed (%zu bytes)\n", bytes); return; }
+        const size_t nb = n / 32;
+        mmb_dq_q8_0_bf16_kernel<<<(unsigned) ((nb + 255) / 256), 256, 0, ctx.stream()>>>((const uint8_t *) w->data, buf, nb);
         CUDA_CHECK(cudaGetLastError());
         g_mmb_shadow[w->data] = buf; g_mmb_shadow_bytes += bytes;
         return;

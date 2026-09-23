@@ -5076,7 +5076,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     {
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             const ggml_tensor * t = cgraph->nodes[i];
-            if (t->op == GGML_OP_MUL_MAT && (t->src[0]->type == GGML_TYPE_IQ4_NL || t->src[0]->type == GGML_TYPE_Q6_K) && ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t)) ggml_cuda_mmb_shadow_prepare(*cuda_ctx, t->src[0]);
+            if (t->op == GGML_OP_MUL_MAT && (t->src[0]->type == GGML_TYPE_IQ4_NL || t->src[0]->type == GGML_TYPE_Q6_K || t->src[0]->type == GGML_TYPE_Q8_0) && ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t)) ggml_cuda_mmb_shadow_prepare(*cuda_ctx, t->src[0]);
         }
     }
     if (ggml_cuda_mmb_down16()) {
