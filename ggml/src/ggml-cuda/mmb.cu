@@ -467,6 +467,8 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
     }
 }
 
+template <int BM_, int BN_, int WTM_, int WTN_> struct mmb_tile { static constexpr int BM = BM_, BN = BN_, WTM = WTM_, WTN = WTN_; };
+
 template <int BM, int BN, int WTM, int WTN, int WTYPE = 0>
 __global__ void __launch_bounds__(MMB_NT, 2)
 mmb_routed_glu_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ Wu, const size_t expert_bytes, const uint16_t * __restrict__ Xh,
@@ -914,21 +916,33 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
             E, T, n_used, ne11, si1, sis1, /*write_inverse=*/false, stream);
     }
-    constexpr int BN_SMALL = 32, THRESH = 128;
-    const int nbig_max   = n_rows / BN + E + 1;
-    const int nsmall_max = E * ((THRESH + BN_SMALL - 1) / BN_SMALL) + 1;
-    ggml_cuda_pool_alloc<uint32_t> desc_big(ctx.pool(), nbig_max);
-    ggml_cuda_pool_alloc<uint32_t> desc_small(ctx.pool(), nsmall_max);
-    mmb_build_desc2<<<1, 1024, 0, stream>>>(bounds.get(), desc_big.get(), desc_small.get(), E, nbig_max, nsmall_max, BN, BN_SMALL, THRESH);
     uint16_t * Dh = ggml_cuda_mmb_slot_reserve(ctx, 2, glu, (size_t) n_rows * M);
     const bool store_f32 = !ggml_cuda_mmb_is_bf16_only(glu);
     const uint8_t * Wg = (const uint8_t *) gw->data, * Wu = (const uint8_t *) uw->data; float * D = (float *) glu->data; const size_t eb = (size_t) gw->nb[2];
-    dim3 gbig((M + 63) / 64, nbig_max), gsmall((M + 63) / 64, nsmall_max);
-    mmb_dispatch_quant(gw->type, [&](auto tag) {
-        constexpr int WT = decltype(tag)::value;
-    mmb_routed_glu_kernel<64, BN, 32, 32, WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
-    mmb_routed_glu_kernel<64, BN_SMALL, 16, 16, WT><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
-    });
+    // LLAMA_MMB_GLU_CFG selects the (big, small) tile pair; 0 is the original 64x128 / 64x32 at threshold 128
+    static const int cfg = [] { const char * e = getenv("LLAMA_MMB_GLU_CFG"); return e ? atoi(e) : 0; }();
+    auto run = [&](auto big, auto small, const int thresh) {
+        using TB = decltype(big); using TS = decltype(small);
+        const int nbig_max   = n_rows / TB::BN + E + 1;
+        const int nsmall_max = E * ((thresh + TS::BN - 1) / TS::BN) + 1;
+        ggml_cuda_pool_alloc<uint32_t> desc_big(ctx.pool(), nbig_max);
+        ggml_cuda_pool_alloc<uint32_t> desc_small(ctx.pool(), nsmall_max);
+        mmb_build_desc2<<<1, 1024, 0, stream>>>(bounds.get(), desc_big.get(), desc_small.get(), E, nbig_max, nsmall_max, TB::BN, TS::BN, thresh);
+        dim3 gbig((M + TB::BM - 1) / TB::BM, nbig_max), gsmall((M + TS::BM - 1) / TS::BM, nsmall_max);
+        mmb_dispatch_quant(gw->type, [&](auto tag) {
+            constexpr int WT = decltype(tag)::value;
+            mmb_routed_glu_kernel<TB::BM, TB::BN, TB::WTM, TB::WTN, WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
+            mmb_routed_glu_kernel<TS::BM, TS::BN, TS::WTM, TS::WTN, WT><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
+        });
+    };
+    switch (cfg) {
+        case 1:  run(mmb_tile<128, 128, 32, 64>{}, mmb_tile<64, 32, 16, 16>{}, 128); break;
+        case 2:  run(mmb_tile<64, 256, 32, 64>{},  mmb_tile<64, 32, 16, 16>{}, 256); break;
+        case 3:  run(mmb_tile<128, 64, 32, 32>{},  mmb_tile<64, 32, 16, 16>{}, 64);  break;
+        case 4:  run(mmb_tile<64, 128, 32, 32>{},  mmb_tile<64, 64, 16, 32>{}, 128); break;
+        case 5:  run(mmb_tile<128, 128, 32, 64>{}, mmb_tile<64, 64, 16, 32>{}, 128); break;
+        default: run(mmb_tile<64, 128, 32, 32>{},  mmb_tile<64, 32, 16, 16>{}, 128); break;
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
