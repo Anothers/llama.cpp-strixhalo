@@ -5146,7 +5146,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             if (xi < 0 || ex->op != GGML_OP_MUL_MAT_ID || ex->type != GGML_TYPE_F32) continue;
             if (!ggml_cuda_mmb_supported_mmid(ex->src[0], ex->src[1], ex->src[2], const_cast<ggml_tensor *>(ex))) continue;
             // Other formats retain F32 expert outputs for the weighted reduction.
-            if (ex->src[0]->type != GGML_TYPE_IQ4_NL) continue;
+            // every mmb quant type (UD GGUFs keep ffn_down_exps at Q5_1); GGML_CUDA_DOWN16_ANY=0 keeps it to IQ4_NL
+            static const bool any16 = [] { const char * e = getenv("GGML_CUDA_DOWN16_ANY"); return !e || atoi(e) != 0; }();
+            if (ex->src[0]->type != GGML_TYPE_IQ4_NL && !any16) continue;
             if (!ggml_node_has_n_uses(cgraph, xi, 1)) continue;
             if (ex->ne[0] % 8 != 0 || ggml_nrows(ex) < 512) continue;
             ggml_cuda_mmb_mark_bf16_only(ex);
