@@ -752,10 +752,18 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     }
     const uint16_t * xhp = mmb_bf16_activation(ctx, src1, (size_t) T * K, stream);
     const uint8_t * W = (const uint8_t *) src0->data; float * D = (float *) dst->data;
-    if (mmb_tall() && src0->type == GGML_TYPE_IQ4_NL && M <= 384 && K >= 4096 && T >= 2048) {   // tall-M tile: HC down|inject [10240 -> 324], activations read once
+    // tall-M tile: HC down|inject [10240 -> 324], activations read once. The UD GGUFs keep hc_*_down at Q8_0, which
+    // fell to the 128x128 tile (3 row tiles, 14 TFLOPS); LLAMA_MMB_TALL_Q8=0 keeps Q8_0 off this path.
+    static const bool tall_q8 = [] { const char * e = getenv("LLAMA_MMB_TALL_Q8"); return !e || atoi(e) != 0; }();
+    if (mmb_tall() && (src0->type == GGML_TYPE_IQ4_NL || (tall_q8 && src0->type == GGML_TYPE_Q8_0)) && M <= 384 && K >= 4096 && T >= 2048) {
         static const int wide = mmb_tall_mode() >= 2;
+        if (src0->type == GGML_TYPE_Q8_0) {
+            if (wide) { dim3 grid(1, (T + 63) / 64); mmb_dense_kernel<384, 64, 96, 32, 1><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, (uint16_t *) nullptr, true, M, K, T); }
+            else      { dim3 grid(1, (T + 31) / 32); mmb_dense_kernel<384, 32, 96, 16, 1><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, (uint16_t *) nullptr, true, M, K, T); }
+        } else {
         if (wide) { dim3 grid(1, (T + 63) / 64); mmb_dense_kernel<384, 64, 96, 32, 0><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, (uint16_t *) nullptr, true, M, K, T); }
         else      { dim3 grid(1, (T + 31) / 32); mmb_dense_kernel<384, 32, 96, 16, 0><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, (uint16_t *) nullptr, true, M, K, T); }
+        }
         CUDA_CHECK(cudaGetLastError());
         return;
     }
