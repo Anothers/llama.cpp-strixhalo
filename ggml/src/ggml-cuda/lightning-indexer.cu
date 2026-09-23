@@ -536,6 +536,7 @@ static void ggml_cuda_lightning_indexer_generic(ggml_backend_cuda_context & ctx,
 
 static bool ggml_cuda_lightning_indexer_generic_supported(int device, const ggml_tensor * dst) {
     GGML_UNUSED(device);
+    if (!dst->src[2] || !dst->src[3]) { return false; } // unit weights / no mask: only the fused RDNA3.5 kernel
 
     const ggml_tensor * q = dst->src[0];
     const ggml_tensor * k = dst->src[1];
@@ -651,13 +652,21 @@ __global__ __launch_bounds__(128) void qsa_indexer_wmma16_keyreg(
     for(int l=0;l<C::ne;++l) {
         const int token=qfirst+C::get_i(l),key=kfirst+warp*16+C::get_j(l);
         if(token<s.nq && key<s.nk) {
-            const float * wr=(const float *)(w+size_t(stream)*s.w3+size_t(token)*s.w1);
             float value=0.0f;
+            if (w) {
+                const float * wr=(const float *)(w+size_t(stream)*s.w3+size_t(token)*s.w1);
 #pragma unroll
-            for(int head=0;head<4;++head) value+=fmaxf(acc[head].x[l],0.0f)*wr[head];
-            const half * mr=(const half *)(mask+size_t(stream%s.nm)*s.m3+size_t(token)*s.m1);
+                for(int head=0;head<4;++head) value+=fmaxf(acc[head].x[l],0.0f)*wr[head];
+            } else {
+#pragma unroll
+                for(int head=0;head<4;++head) value+=fmaxf(acc[head].x[l],0.0f);
+            }
             float * out=(float *)(dst+size_t(stream)*s.d3+size_t(token)*s.d1);
-            out[key]=value+float(mr[key]);
+            if (mask) {
+                const half * mr=(const half *)(mask+size_t(stream%s.nm)*s.m3+size_t(token)*s.m1);
+                value+=float(mr[key]);
+            }
+            out[key]=value;
         }
     }
 #else
@@ -667,15 +676,18 @@ __global__ __launch_bounds__(128) void qsa_indexer_wmma16_keyreg(
 
 static bool supports_indexer4(int device, const ggml_tensor * dst) {
     const auto * q=dst->src[0], * k=dst->src[1], * w=dst->src[2], * m=dst->src[3];
-    if (!q || !k || !w || !m || !GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[device].cc)) { return false; }
+    if (!q || !k || !GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[device].cc)) { return false; }
     if (q->type != GGML_TYPE_F32 || (k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_F16) ||
-            w->type != GGML_TYPE_F32 || m->type != GGML_TYPE_F16 || dst->type != GGML_TYPE_F32 ||
+            dst->type != GGML_TYPE_F32 ||
             q->ne[0] != 128 || q->ne[1] != 4 || k->ne[0] != 128 || k->ne[1] != 1 ||
             q->ne[2] < 1 || q->ne[2] > 262140 || q->ne[3] > 65535 || k->ne[2] > INT_MAX ||
-            q->ne[3] != k->ne[3] || w->ne[0] != 4 || w->ne[1] != q->ne[2] ||
-            w->ne[2] != 1 || w->ne[3] != q->ne[3] || m->ne[0] != k->ne[2] ||
-            m->ne[1] != q->ne[2] || m->ne[2] != 1 || m->ne[3] < 1 || q->ne[3] % m->ne[3] != 0) { return false; }
+            q->ne[3] != k->ne[3]) { return false; }
+    if (w && (w->type != GGML_TYPE_F32 || w->ne[0] != 4 || w->ne[1] != q->ne[2] ||
+            w->ne[2] != 1 || w->ne[3] != q->ne[3])) { return false; }
+    if (m && (m->type != GGML_TYPE_F16 || m->ne[0] != k->ne[2] ||
+            m->ne[1] != q->ne[2] || m->ne[2] != 1 || m->ne[3] < 1 || q->ne[3] % m->ne[3] != 0)) { return false; }
     for (const auto * t : {q, k, w, m, dst}) {
+        if (!t) { continue; }
         const size_t ts=ggml_type_size(t->type);
         if (t->nb[0] != ts) { return false; }
         for (int j=1;j<4;++j) { if (t->nb[j]%ts != 0) { return false; } }
@@ -689,14 +701,16 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
         return;
     }
     const auto * q=dst->src[0], * k=dst->src[1], * w=dst->src[2], * m=dst->src[3];
-    indexer_layout s{q->nb[1],q->nb[2],q->nb[3],k->nb[2],k->nb[3],w->nb[1],w->nb[3],
-        m->nb[1],m->nb[3],dst->nb[1],dst->nb[3],int(q->ne[2]),int(k->ne[2]),int(m->ne[3])};
+    indexer_layout s{q->nb[1],q->nb[2],q->nb[3],k->nb[2],k->nb[3],w ? w->nb[1] : 0,w ? w->nb[3] : 0,
+        m ? m->nb[1] : 0,m ? m->nb[3] : 0,dst->nb[1],dst->nb[3],int(q->ne[2]),int(k->ne[2]),m ? int(m->ne[3]) : 1};
+    const char * wp = w ? (const char *) w->data : nullptr;
+    const char * mp = m ? (const char *) m->data : nullptr;
     const dim3 grid((s.nk+63)/64,(s.nq+15)/16,q->ne[3]), block(32,4);
     ggml_cuda_kernel_launch_params launch(grid,block,0,ctx.stream());
     if (k->type==GGML_TYPE_F32) {
-        ggml_cuda_kernel_launch(qsa_indexer_wmma16_keyreg<float>,launch,(const char*)q->data,(const char*)k->data,(const char*)w->data,(const char*)m->data,(char*)dst->data,s);
+        ggml_cuda_kernel_launch(qsa_indexer_wmma16_keyreg<float>,launch,(const char*)q->data,(const char*)k->data,wp,mp,(char*)dst->data,s);
     } else {
-        ggml_cuda_kernel_launch(qsa_indexer_wmma16_keyreg<half>,launch,(const char*)q->data,(const char*)k->data,(const char*)w->data,(const char*)m->data,(char*)dst->data,s);
+        ggml_cuda_kernel_launch(qsa_indexer_wmma16_keyreg<half>,launch,(const char*)q->data,(const char*)k->data,wp,mp,(char*)dst->data,s);
     }
     CUDA_CHECK(cudaGetLastError());
 }

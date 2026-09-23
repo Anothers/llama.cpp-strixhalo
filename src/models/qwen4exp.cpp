@@ -1177,9 +1177,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         ggml_tensor * query_mask = kq_mask == nullptr ? nullptr : ggml_view_4d(ctx0, kq_mask,
                 n_kv, n_query, 1, n_stream, kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], first*kq_mask->nb[1]);
 
+        ggml_tensor * score = nullptr;
+        // [QSA_FUSED_INDEXER] sum_h relu(q_h . k) in one pass: the fused lightning-indexer kernel keeps a tile of block
+        // keys in registers and walks the query rows, so the [blocks, heads, queries] f32 product is never written out.
+        // Unfused, that product is ~6.5 GB per layer at 200K context and dominates long-context prefill.
+        // LLAMA_QSA_FUSED_INDEXER=0 restores the matmul + relu + head-sum graph.
+        static const bool fused_indexer = [] { const char * e = getenv("LLAMA_QSA_FUSED_INDEXER"); return !e || atoi(e) != 0; }();
+        if (fused_indexer && idx_dim == 128 && n_idx_h == 4) {
+            ggml_tensor * q4 = ggml_view_4d(ctx0, q, idx_dim, n_idx_h, n_query, n_stream,
+                    q->nb[1], q->nb[2], q->nb[2]*n_tps, first*q->nb[2]);
+            ggml_tensor * k4 = ggml_view_4d(ctx0, score_keys, idx_dim, 1, score_blocks, n_stream,
+                    score_keys->nb[1], score_keys->nb[1], score_keys->nb[2], 0);
+            score = ggml_lightning_indexer(ctx0, q4, k4, nullptr, nullptr);
+            score = ggml_reshape_3d(ctx0, score, score_blocks, n_query, n_stream);
+        } else {
         // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
         // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
-        ggml_tensor * score = ggml_mul_mat(ctx0, score_keys,
+        score = ggml_mul_mat(ctx0, score_keys,
                 ggml_view_3d(ctx0, q, idx_dim, n_idx_h*n_query, n_stream, q->nb[1], q->nb[2]*n_tps, first*q->nb[2]));
         score = ggml_reshape_4d(ctx0, score, score_blocks, n_idx_h, n_query, n_stream);
         score = ggml_relu(ctx0, score);
@@ -1193,6 +1207,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         }
 
         score = summed;
+        }
         cb(score, "indexer_score", il);
 
         // one value per block, so it is cheaper to bias here than after the cells are expanded

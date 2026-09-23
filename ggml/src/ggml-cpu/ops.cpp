@@ -12092,25 +12092,24 @@ void ggml_compute_forward_lightning_indexer(
 
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(   q->type == GGML_TYPE_F32);
-    GGML_ASSERT(   w->type == GGML_TYPE_F32);
-    GGML_ASSERT(   m->type == GGML_TYPE_F16);
+    GGML_ASSERT(!w || w->type == GGML_TYPE_F32);
+    GGML_ASSERT(!m || m->type == GGML_TYPE_F16);
 
     GGML_TENSOR_LOCALS(int64_t, neq,  q, ne)
     GGML_TENSOR_LOCALS(size_t,  nbq,  q, nb)
     GGML_TENSOR_LOCALS(int64_t, nek,  k, ne)
     GGML_TENSOR_LOCALS(size_t,  nbk,  k, nb)
-    GGML_TENSOR_LOCALS(int64_t, new,  w, ne)
-    GGML_TENSOR_LOCALS(size_t,  nbw,  w, nb)
-    GGML_TENSOR_LOCALS(int64_t, nem,  m, ne)
-    GGML_TENSOR_LOCALS(size_t,  nbm,  m, nb)
     GGML_TENSOR_LOCALS(int64_t, ne, dst, ne)
     GGML_TENSOR_LOCALS(size_t,  nb, dst, nb)
+    const size_t  nbw1 = w ? w->nb[1] : 0, nbw3 = w ? w->nb[3] : 0;
+    const size_t  nbm1 = m ? m->nb[1] : 0, nbm3 = m ? m->nb[3] : 0;
+    const int64_t nem3 = m ? m->ne[3] : 1;
 
     GGML_ASSERT( nb0 == ggml_type_size(dst->type));
     GGML_ASSERT(nbq0 == ggml_type_size(  q->type));
     GGML_ASSERT(nbk0 == ggml_type_size(  k->type));
-    GGML_ASSERT(nbw0 == ggml_type_size(  w->type));
-    GGML_ASSERT(nbm0 == ggml_type_size(  m->type));
+    GGML_ASSERT(!w || w->nb[0] == ggml_type_size(w->type));
+    GGML_ASSERT(!m || m->nb[0] == ggml_type_size(m->type));
 
     const int n_embd    = q->ne[0];
     const int n_head    = q->ne[1];
@@ -12137,8 +12136,8 @@ void ggml_compute_forward_lightning_indexer(
 
     for (int s = 0; s < n_stream; ++s) {
         for (int t = 0; t < n_tokens; ++t) {
-            const float       *   w_row =       (float *) ((char *)   w->data + t*nbw1 +        s*nbw3);
-            const ggml_fp16_t *   m_row = (ggml_fp16_t *) ((char *)   m->data + t*nbm1 + (s%nem3)*nbm3);
+            const float       *   w_row = w ?       (float *) ((char *)   w->data + t*nbw1 +        s*nbw3) : nullptr;
+            const ggml_fp16_t *   m_row = m ? (ggml_fp16_t *) ((char *)   m->data + t*nbm1 + (s%nem3)*nbm3) : nullptr;
             float             * dst_row =       (float *) ((char *) dst->data + t*nb1  +        s*nb3 );
             for (int ik = ir0; ik < ir1; ++ik) {
                 char * k_row = (char *) k->data + ik*nbk2 + s*nbk3;
@@ -12154,10 +12153,10 @@ void ggml_compute_forward_lightning_indexer(
                     const float * q_row = (float *) ((char *) q->data + h*nbq1 + t*nbq2 + s*nbq3);
                     ggml_vec_dot_f32(n_embd, &qk, 0, q_row, 0, k_row_f32, 0, 1);
                     // ReLU and weights (prescaled)
-                    score += MAX(qk, 0.0f) * w_row[h];
+                    score += MAX(qk, 0.0f) * (w_row ? w_row[h] : 1.0f);
                 }
                 // apply mask
-                dst_row[ik] = score + GGML_CPU_FP16_TO_FP32(m_row[ik]);
+                dst_row[ik] = score + (m_row ? GGML_CPU_FP16_TO_FP32(m_row[ik]) : 0.0f);
             }
         }
     }
