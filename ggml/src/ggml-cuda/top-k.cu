@@ -1004,7 +1004,16 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (top_k_use_small_kernel(ncols, nrows, k)) {
         top_k_small_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
     } else if (ncols > 1024) {
-        top_k_parallel_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
+        // many rows (the QSA block selection: one row per query of a prefill ubatch) keep the whole radix select
+        // in one workgroup per row with the histogram in LDS; the split version round-trips a global histogram
+        // of nrows*blocks_per_row*256 ints through memory on each of its four passes.
+        // GGML_CUDA_TOPK_ROWWISE_MIN_ROWS (default 256; 0 = never) sets where the per-row kernel takes over.
+        static const int rowwise_min = [] { const char * e = getenv("GGML_CUDA_TOPK_ROWWISE_MIN_ROWS"); return e ? atoi(e) : 256; }();
+        if (rowwise_min > 0 && nrows >= rowwise_min) {
+            top_k_radix_select_cuda(src0_d, dst_d, ncols, nrows, k, stream);
+        } else {
+            top_k_parallel_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
+        }
     } else {
         ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * nrows);
         int * tmp_dst = temp_dst_alloc.get();
