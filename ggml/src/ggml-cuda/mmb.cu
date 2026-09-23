@@ -5,6 +5,7 @@
 #include <utility>
 #include "mmid.cuh"
 #include <cstdlib>
+#include "hblt.cuh"
 #include <vector>
 #include <unordered_set>
 
@@ -778,6 +779,10 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     if (mmb_tall() && (src0->type == GGML_TYPE_IQ4_NL || (tall_q8 && src0->type == GGML_TYPE_Q8_0)) && M <= 384 && K >= 4096 && T >= 2048) {
         static const int wide = mmb_tall_mode() >= 2;
         const uint16_t * tall_shadow = src0->type == GGML_TYPE_Q8_0 ? mmb_shadow_lookup(src0) : nullptr;
+        if (tall_shadow && ggml_cuda_hblt_gemm_bf16(ctx, tall_shadow, xhp, D, M, K, T, stream)) {
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
         if (tall_shadow && wide) {
             dim3 grid(1, (T + 63) / 64);
             mmb_dense_kernel<384, 64, 96, 32, 2><<<grid, MMB_NT, 0, stream>>>((const uint8_t *) tall_shadow, xhp, D, (uint16_t *) nullptr, true, M, K, T);
