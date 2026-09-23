@@ -1316,8 +1316,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         cparams.flash_attn && cparams.offload_kqv && hparams.f_max_alibi_bias==0.0f && !hparams.attn_soft_cap &&
         shared_qsa!=qsa_inps.end() && shared_qsa->second->maskless;
     const int64_t strip=layout_prefill ? n_tps : qwen4exp_query_strip(n_tps,n_stream);
+    // LLAMA_QSA_NOPACK=0 restores the per-ubatch repack of the whole cache into [4 keys][dims] blocks; by default
+    // the qsa3 kernel reads the cache views in place (src[6] / src[7] = the unpacked views)
+    static const bool qsa_nopack = [] { const char * e = getenv("LLAMA_QSA_NOPACK"); return !e || atoi(e) != 0; }();
     ggml_tensor * packed_keys=nullptr;
-    if (layout_prefill) {
+    if (layout_prefill && qsa_nopack) {
+        auto * ok_=ggml_permute(ctx0,mctx_cur->get_k(ctx0,il),0,2,1,3);
+        auto * ov_=ggml_permute(ctx0,mctx_cur->get_v(ctx0,il),0,2,1,3);
+        if (ok_->type==GGML_TYPE_F16 && ok_->ne[0]==256 && ok_->ne[1]%4==0 && ok_->ne[3]==1 &&
+            ov_->type==GGML_TYPE_F16 && ov_->ne[0]==256 && ok_->nb[0]==2 && ov_->nb[0]==2) {
+            packed_keys=ok_;
+        }
+    }
+    if (layout_prefill && !qsa_nopack) {
         auto * original_keys=ggml_permute(ctx0,mctx_cur->get_k(ctx0,il),0,2,1,3);
         if (original_keys->type==GGML_TYPE_F16 && original_keys->ne[0]==256 && original_keys->ne[1]%4==0 && original_keys->ne[3]==1) {
             packed_keys=qsa_pack_keys(ctx0,original_keys);
@@ -1327,7 +1338,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     // QSA attention v2 (qsa-attn/qsa2.cu) consumes V^T fragments straight from a [4 keys][256 dims] block
     // layout; build it once per graph next to the packed keys when requested.
     ggml_tensor * packed_values=nullptr;
-    if (layout_prefill) {
+    // V goes in unpacked too: the qsa3 launcher packs it in one pass (LLAMA_QSA_NOPACK_V=0: graph-level repack)
+    static const bool qsa_nopack_v = [] { const char * e = getenv("LLAMA_QSA_NOPACK_V"); return !e || atoi(e) != 0; }();
+    if (packed_keys && qsa_nopack && qsa_nopack_v) {
+        packed_values=ggml_permute(ctx0,mctx_cur->get_v(ctx0,il),0,2,1,3);
+    }
+    if (layout_prefill && !(qsa_nopack && qsa_nopack_v)) {
         auto * original_values=ggml_permute(ctx0,mctx_cur->get_v(ctx0,il),0,2,1,3);
         if (original_values->type==GGML_TYPE_F16 && original_values->ne[0]==256 && original_values->ne[1]%4==0 && original_values->ne[3]==1) {
             packed_values=qsa_pack_values(ctx0,original_values);

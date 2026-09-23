@@ -935,7 +935,7 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
 
     // F32 tensors that are only ever written as BF16 (see ggml_cuda_mmb_mark_half_alloc) need half the bytes;
     // the marks are made in graph_optimize, which the scheduler runs before allocating the split
-    static const bool half16 = [] { const char * e = getenv("GGML_CUDA_BF16_ALLOC"); return e && atoi(e) != 0; }();
+    static const bool half16 = [] { const char * e = getenv("GGML_CUDA_BF16_ALLOC"); return !e || atoi(e) != 0; }();
     if (half16 && tensor->type == GGML_TYPE_F32 && tensor->view_src == nullptr && ggml_cuda_mmb_is_half_alloc(tensor)) {
         return (size / 2 + 255) & ~(size_t) 255;
     }

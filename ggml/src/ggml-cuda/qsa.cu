@@ -3,6 +3,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
+#include <algorithm>
 #include "qsa-decode.cuh"
 
 typedef short v16s __attribute__((ext_vector_type(16)));
@@ -170,8 +172,13 @@ struct qsa3_layout {
     size_t q1, q2, o1, o2, m1;
     int nk, n_q, gqa, cap;
     float scale;
+    size_t k1, k2, v1, v2;   // DIRECT: element strides of the unpacked K/V cache views (cell, kv head)
 };
 
+// DIRECT reads the K/V cache in place: a K fragment row is 16 contiguous dims of one cell, a V fragment gathers
+// one dim of the 4 cells of a block. Without it the graph repacks the whole cache every ubatch (4 full copies
+// per QSA layer, linear in context depth).
+template <bool DIRECT, bool DIRECT_V>
 __global__ __launch_bounds__(256) void qsa3_attn_kernel(
         const float * __restrict__ q, const uint16_t * __restrict__ pk, const uint16_t * __restrict__ pv,
         const uint16_t * __restrict__ mask, const uint16_t * __restrict__ ublk, const uint16_t * __restrict__ umask,
@@ -241,6 +248,16 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
     };
     auto load_k = [&](const uint32_t b01, const uint32_t b23, v16s * kf) {
         const int kb = blk_of(b01, b23, r >> 2);
+        if constexpr (DIRECT) {
+            const uint16_t * kc = pk + (size_t) kvh * s.k2 + (size_t) (4*kb + (r & 3)) * s.k1 + 32*w;
+#pragma unroll
+            for (int t = 0; t < 2; ++t) {
+                const uint4 lo  = *reinterpret_cast<const uint4 *>(kc + 16*t);
+                const uint4 hi4 = *reinterpret_cast<const uint4 *>(kc + 16*t + 8);
+                kf[t] = __builtin_bit_cast(v16s, (uint4[2]){lo, hi4});
+            }
+            return;
+        }
         const uint16_t * krow = pkg + (size_t) kb * 1024 + (r & 3) * 16 + w * 128;
 #pragma unroll
         for (int t = 0; t < 2; ++t) {
@@ -266,6 +283,22 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
         v16s vf[2];
         {
             const int kb0 = blk_of(b01, b23, 0), kb1 = blk_of(b01, b23, 1), kb2 = blk_of(b01, b23, 2), kb3 = blk_of(b01, b23, 3);
+            if constexpr (DIRECT_V) {
+                const uint16_t * vb = pv + (size_t) kvh * s.v2;
+                const int kbs[4] = {kb0, kb1, kb2, kb3};
+#pragma unroll
+                for (int t = 0; t < 2; ++t) {
+                    const int d = 32*w + 16*t + r;
+                    uint32_t wv[8];
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const uint16_t * vc = vb + (size_t) (4*kbs[j]) * s.v1 + d;
+                        const uint32_t e0 = vc[0], e1 = vc[s.v1], e2 = vc[2*s.v1], e3 = vc[3*s.v1];
+                        wv[2*j] = e0 | (e1 << 16); wv[2*j + 1] = e2 | (e3 << 16);
+                    }
+                    vf[t] = __builtin_bit_cast(v16s, (uint4[2]){make_uint4(wv[0], wv[1], wv[2], wv[3]), make_uint4(wv[4], wv[5], wv[6], wv[7])});
+                }
+            } else
 #pragma unroll
             for (int t = 0; t < 2; ++t) {
                 const int d = 32*w + 16*t + r;
@@ -393,6 +426,23 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
     }
 }
 
+// V cache view -> [block of 4 cells][256 dims][4 cells] in one pass: each thread gathers 2 dims of the 4 cells
+// (four 4-byte loads, coalesced across the dims) and writes 16 bytes
+static __global__ void qsa3_pack_v_kernel(const uint16_t * __restrict__ v, uint16_t * __restrict__ out,
+        const size_t v1, const size_t v2, const int nblk, const int nkvh) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;   // (head, blk, dim pair)
+    if (i >= (size_t) nkvh * nblk * 128) return;
+    const int dp = (int) (i % 128); const size_t hb = i / 128; const int kb = (int) (hb % nblk), h = (int) (hb / nblk);
+    const uint16_t * src = v + (size_t) h * v2 + (size_t) (4*kb) * v1 + 2*dp;
+    uint32_t c[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) c[j] = *reinterpret_cast<const uint32_t *>(src + j * v1);
+    // out[(h*nblk + kb)*1024 + d*4 + cell]: dims 2dp and 2dp+1
+    const uint32_t d0a = (c[0] & 0xffffu) | (c[1] << 16), d0b = (c[2] & 0xffffu) | (c[3] << 16);
+    const uint32_t d1a = (c[0] >> 16) | (c[1] & 0xffff0000u), d1b = (c[2] >> 16) | (c[3] & 0xffff0000u);
+    *reinterpret_cast<uint4 *>(out + hb * 1024 + (size_t) (2*dp) * 4) = make_uint4(d0a, d0b, d1a, d1b);
+}
+
 bool ggml_cuda_flash_attn_ext_qsa_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
     const auto * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * m = dst->src[3], * ids = dst->src[5];
     const auto * packed = dst->src[6], * pv = dst->src[7];
@@ -408,9 +458,14 @@ bool ggml_cuda_flash_attn_ext_qsa_supported(ggml_backend_cuda_context & ctx, con
         ids->nb[0] != 4 || ids->ne[1] < q->ne[1] || ids->ne[2] != 1 || ids->ne[3] != 1 || ids->ne[0] < 1 || ids->ne[0] > 2560 ||
         ids->nb[1] % 4 || uintptr_t(ids->data) % 4 || q->nb[1] % 16 || q->nb[2] % 16 || uintptr_t(q->data) % 16 ||
         !ggml_is_contiguous(dst)) { return false; }
-    if (packed->type != GGML_TYPE_F16 || !ggml_is_contiguous(packed) || packed->ne[0] != 16 || packed->ne[1] != 4 ||
+    // DIRECT: src[6] (and/or src[7]) are the unpacked K (V) cache views themselves
+    if (packed->ne[0] == 256) {
+        if (packed->data != k->data || k->nb[1] % 16 || k->nb[2] % 16 || uintptr_t(k->data) % 16) { return false; }
+    } else if (packed->type != GGML_TYPE_F16 || !ggml_is_contiguous(packed) || packed->ne[0] != 16 || packed->ne[1] != 4 ||
         packed->ne[2] != 16 || packed->ne[3] != k->ne[1]/4*k->ne[2] || uintptr_t(packed->data) % 16) { return false; }
-    if (pv->type != GGML_TYPE_F16 || !ggml_is_contiguous(pv) || pv->ne[0] != 4 || pv->ne[1] != 256 ||
+    if (pv->ne[0] == 256) {
+        if (pv->data != v->data || v->nb[1] < 512 || v->nb[1] % 4 || v->nb[2] % 4 || uintptr_t(v->data) % 4) { return false; }
+    } else if (pv->type != GGML_TYPE_F16 || !ggml_is_contiguous(pv) || pv->ne[0] != 4 || pv->ne[1] != 256 ||
         pv->ne[2] != k->ne[1]/4*k->ne[2] || pv->ne[3] != 1 || uintptr_t(pv->data) % 8) { return false; }
     return !m || (m->type == GGML_TYPE_F16 && m->nb[0] == 2 && m->ne[0] >= k->ne[1] && m->ne[1] >= q->ne[1] && m->ne[2] == 1 && m->ne[3] == 1);
 }
@@ -435,9 +490,36 @@ void ggml_cuda_flash_attn_ext_qsa(ggml_backend_cuda_context & ctx, ggml_tensor *
                                 (const int *) srow.get(), (const int *) sflag.get(), ublk.get(), umask.get(), ucount.get(), cap);
         CUDA_CHECK(cudaGetLastError());
     }
-    qsa3_layout layout{q->nb[1], q->nb[2], dst->nb[1], dst->nb[2], m ? m->nb[1] : 0, nk, n_q, 12, cap, scale};
+    const auto * v = dst->src[2];
+    const bool direct = pk->ne[0] == 256;
+    // an unpacked V view is packed here (one vectorized pass) unless LLAMA_QSA_VGATHER=1 gathers it in the kernel
+    static const bool vgather = [] { const char * e = getenv("LLAMA_QSA_VGATHER"); return e && atoi(e) != 0; }();
+    const bool direct_v = pv->ne[0] == 256 && vgather;
+    const uint16_t * pv_data = (const uint16_t *) pv->data;
+    ggml_cuda_pool_alloc<uint16_t> vpack(ctx.pool());
+    if (pv->ne[0] == 256 && !vgather) {
+        const int nblk = nk / 4, nkvh = (int) k->ne[2];
+        vpack.alloc((size_t) nkvh * nblk * 1024);
+        const size_t n = (size_t) nkvh * nblk * 128;
+        qsa3_pack_v_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, ctx.stream()>>>((const uint16_t *) pv->data, vpack.get(), v->nb[1] / 2, v->nb[2] / 2, nblk, nkvh);
+        CUDA_CHECK(cudaGetLastError());
+        pv_data = vpack.get();
+    }
+    static const bool stats = [] { const char * e = getenv("LLAMA_QSA3_STATS"); return e && atoi(e) != 0; }();
+    hipStreamCaptureStatus qcs = hipStreamCaptureStatusNone;
+    if (stats && hipStreamIsCapturing(ctx.stream(), &qcs) == hipSuccess && qcs == hipStreamCaptureStatusNone) {   // needs GGML_CUDA_DISABLE_GRAPHS=1 in prefill
+        std::vector<int> uc(ngroups);
+        CUDA_CHECK(cudaMemcpyAsync(uc.data(), ucount.get(), ngroups * sizeof(int), cudaMemcpyDeviceToHost, ctx.stream()));
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+        double sum = 0; int mx = 0; for (int x : uc) { sum += x; mx = std::max(mx, x); }
+        fprintf(stderr, "qsa3: n_q=%d nk=%d ns=%d groups=%d  union blocks mean %.0f max %d  -> cells/query %.0f (ideal %d)\n",
+                n_q, nk, ns, ngroups, sum / ngroups, mx, sum / ngroups * 4 / QSA3_G, ns);
+    }
+    qsa3_layout layout{q->nb[1], q->nb[2], dst->nb[1], dst->nb[2], m ? m->nb[1] : 0, nk, n_q, 12, cap, scale,
+                       k->nb[1] / 2, k->nb[2] / 2, v->nb[1] / 2, v->nb[2] / 2};
     const ggml_cuda_kernel_launch_params launch(dim3(ngroups, k->ne[2]), dim3(256), 0, ctx.stream());
-    ggml_cuda_kernel_launch(qsa3_attn_kernel, launch, (const float *) q->data, (const uint16_t *) pk->data, (const uint16_t *) pv->data,
+    ggml_cuda_kernel_launch(direct ? (direct_v ? qsa3_attn_kernel<true, true> : qsa3_attn_kernel<true, false>)
+                                   : (direct_v ? qsa3_attn_kernel<false, true> : qsa3_attn_kernel<false, false>), launch, (const float *) q->data, (const uint16_t *) pk->data, pv_data,
                             m ? (const uint16_t *) m->data : nullptr, (const uint16_t *) ublk.get(), (const uint16_t *) umask.get(),
                             (const int *) ucount.get(), (float *) dst->data, layout);
     CUDA_CHECK(cudaGetLastError());
