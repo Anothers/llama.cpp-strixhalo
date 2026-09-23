@@ -227,32 +227,6 @@ mmb_dense_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__ X
         [&](int i) { return (t0 + i < T) ? t0 + i : -1; }, D, Dh, store_f32, M, [&](int i) { return (t0 + i < T) ? t0 + i : -1; }, m0, T - t0, As, Bs);
 }
 
-// split-K dense GEMM for tall shapes (few output rows, long K): blockIdx.z owns K slice [z*Ks, (z+1)*Ks) and writes
-// a partial product to Dpart[z]; mmb_splitk_reduce sums the slices in slice order. The activation row stride stays the
-// full K: row r of the slice is addressed as row r*S of a matrix with row length Ks, based at Xh + k0.
-template <int BM, int BN, int WTM, int WTN, int WTYPE>
-__global__ void __launch_bounds__(MMB_NT, 2)
-mmb_dense_splitk_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__ Xh, float * __restrict__ Dpart,
-        const int M, const int K, const int T, const int S) {
-    __shared__ __align__(16) uint16_t As[BM * MMB_LDS_STRIDE];
-    __shared__ __align__(16) uint16_t Bs[BN * MMB_LDS_STRIDE];
-    const int m0 = blockIdx.x * BM, t0 = blockIdx.y * BN, z = blockIdx.z;
-    const int Ks = K / S, k0 = z * Ks;
-    const size_t wrow_bytes = mmb_row_bytes<WTYPE>(K);
-    const uint8_t * Wz = W + (size_t)m0 * wrow_bytes + mmb_row_bytes<WTYPE>(k0);
-    float * Dz = Dpart + (size_t) z * T * M;
-    mmb_tile_gemm<BM, BN, WTM, WTN, WTYPE, false>(Wz, wrow_bytes, M - m0, Xh + k0, Ks,
-        [&](int i) { return (t0 + i < T) ? (t0 + i) * S : -1; }, Dz, (uint16_t *) nullptr, true, M,
-        [&](int i) { return (t0 + i < T) ? t0 + i : -1; }, m0, T - t0, As, Bs);
-}
-__global__ void mmb_splitk_reduce(const float * __restrict__ Dpart, float * __restrict__ D, const size_t n, const int S) {
-    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    float acc = Dpart[i];
-    for (int z = 1; z < S; ++z) acc += Dpart[(size_t) z * n + i];
-    D[i] = acc;
-}
-
 #if defined(__HIP_PLATFORM_AMD__)
 __device__ __forceinline__ float gm_mul_rn(const float a, const float b) { float r; asm("v_mul_f32_e32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b)); return r; }
 __device__ __forceinline__ float gm_add_rn(const float a, const float b) { float r; asm("v_add_f32_e32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b)); return r; }
@@ -783,19 +757,6 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     static const bool tall_q8 = [] { const char * e = getenv("LLAMA_MMB_TALL_Q8"); return !e || atoi(e) != 0; }();
     if (mmb_tall() && (src0->type == GGML_TYPE_IQ4_NL || (tall_q8 && src0->type == GGML_TYPE_Q8_0)) && M <= 384 && K >= 4096 && T >= 2048) {
         static const int wide = mmb_tall_mode() >= 2;
-        // LLAMA_MMB_TALL_SPLITK=S (default 4, 1 = off): the tall shape has only T/64 workgroups over a 160-step K loop,
-        // too few to hide the loop latency; S slices give S times the workgroups
-        static const int splitk = [] { const char * e = getenv("LLAMA_MMB_TALL_SPLITK"); return e ? atoi(e) : 4; }();
-        if (splitk > 1 && wide && K % (splitk * MMB_BK) == 0 && (src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_IQ4_NL)) {
-            ggml_cuda_pool_alloc<float> part(ctx.pool(), (size_t) splitk * T * M);
-            dim3 grid(1, (T + 63) / 64, splitk);
-            if (src0->type == GGML_TYPE_Q8_0) mmb_dense_splitk_kernel<384, 64, 96, 32, 1><<<grid, MMB_NT, 0, stream>>>(W, xhp, part.get(), M, K, T, splitk);
-            else                              mmb_dense_splitk_kernel<384, 64, 96, 32, 0><<<grid, MMB_NT, 0, stream>>>(W, xhp, part.get(), M, K, T, splitk);
-            const size_t n = (size_t) T * M;
-            mmb_splitk_reduce<<<(n + 255) / 256, 256, 0, stream>>>(part.get(), D, n, splitk);
-            CUDA_CHECK(cudaGetLastError());
-            return;
-        }
         if (src0->type == GGML_TYPE_Q8_0) {
             if (wide) { dim3 grid(1, (T + 63) / 64); mmb_dense_kernel<384, 64, 96, 32, 1><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, (uint16_t *) nullptr, true, M, K, T); }
             else      { dim3 grid(1, (T + 31) / 32); mmb_dense_kernel<384, 32, 96, 16, 1><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, (uint16_t *) nullptr, true, M, K, T); }
