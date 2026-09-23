@@ -776,7 +776,11 @@ uint16_t * ggml_cuda_mmb_slot_reserve(ggml_backend_cuda_context & ctx, int slot,
     e.root = mmb_root(t); e.data = t->data; e.n = n;
     return e.buf->get();
 }
-void ggml_cuda_mmb_marks_clear() { g_mmb_bf16_only.clear(); }
+static std::unordered_set<const ggml_tensor *> g_mmb_half_alloc;
+void ggml_cuda_mmb_marks_clear() { g_mmb_bf16_only.clear(); g_mmb_half_alloc.clear(); }
+// bf16-only tensors whose producer never writes F32 into tensor->data: the allocator can give them half the bytes
+void ggml_cuda_mmb_mark_half_alloc(const ggml_tensor * t) { g_mmb_bf16_only.insert(t); g_mmb_half_alloc.insert(t); }
+bool ggml_cuda_mmb_is_half_alloc(const ggml_tensor * t) { return g_mmb_half_alloc.count(t) > 0; }
 size_t ggml_cuda_mmb_marks_count() { return g_mmb_bf16_only.size(); }
 void ggml_cuda_mmb_mark_bf16_only(const ggml_tensor * t) { g_mmb_bf16_only.insert(t); }
 bool ggml_cuda_mmb_is_bf16_only(const ggml_tensor * t) { return g_mmb_bf16_only.count(t) > 0; }

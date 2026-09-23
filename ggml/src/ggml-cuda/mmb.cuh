@@ -15,6 +15,8 @@ uint16_t * ggml_cuda_mmb_slot_reserve(ggml_backend_cuda_context & ctx, int slot,
 void ggml_cuda_mmb_marks_clear();
 size_t ggml_cuda_mmb_marks_count();
 void ggml_cuda_mmb_mark_bf16_only(const ggml_tensor * t);
+void ggml_cuda_mmb_mark_half_alloc(const ggml_tensor * t);
+bool ggml_cuda_mmb_is_half_alloc(const ggml_tensor * t);
 bool ggml_cuda_mmb_is_bf16_only(const ggml_tensor * t);
 bool ggml_cuda_mmb_gatemix();
 bool ggml_cuda_mmb_down16();

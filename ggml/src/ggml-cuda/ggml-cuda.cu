@@ -933,6 +933,13 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
         : ggml_nbytes(tensor);
     int64_t ne0 = tensor->ne[0];
 
+    // F32 tensors that are only ever written as BF16 (see ggml_cuda_mmb_mark_half_alloc) need half the bytes;
+    // the marks are made in graph_optimize, which the scheduler runs before allocating the split
+    static const bool half16 = [] { const char * e = getenv("GGML_CUDA_BF16_ALLOC"); return e && atoi(e) != 0; }();
+    if (half16 && tensor->type == GGML_TYPE_F32 && tensor->view_src == nullptr && ggml_cuda_mmb_is_half_alloc(tensor)) {
+        return (size / 2 + 255) & ~(size_t) 255;
+    }
+
     // [TAG_ALLOC_SIZE_EXPAND]
     if (ggml_is_quantized(tensor->type)) {
         if (ne0 % MATRIX_ROW_PADDING != 0) {
@@ -5076,7 +5083,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                         if (t == sig) continue;
                         ok = false;
                     }
-                    if (ok) ggml_cuda_mmb_mark_bf16_only(zr);
+                    if (ok) ggml_cuda_mmb_mark_half_alloc(zr);
                 }
                 const ggml_tensor * d = nm.dst;
                 if (ggml_nrows(d) >= 512) {
@@ -5090,7 +5097,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                             ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t)) continue;
                         ok = false;
                     }
-                    if (ok && nread > 0) ggml_cuda_mmb_mark_bf16_only(d);
+                    if (ok && nread > 0) ggml_cuda_mmb_mark_half_alloc(d);
                 }
             }
 
@@ -5111,7 +5118,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     if (t->op == GGML_OP_TRANSPOSE && t->view_src == x) continue;
                     ok = false;
                 }
-                if (ok) ggml_cuda_mmb_mark_bf16_only(x);
+                if (ok) ggml_cuda_mmb_mark_half_alloc(x);
             }
 
             for (int i = 0; i < cgraph->n_nodes; ++i) {
@@ -5151,7 +5158,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             if (ex->src[0]->type != GGML_TYPE_IQ4_NL && !any16) continue;
             if (!ggml_node_has_n_uses(cgraph, xi, 1)) continue;
             if (ex->ne[0] % 8 != 0 || ggml_nrows(ex) < 512) continue;
-            ggml_cuda_mmb_mark_bf16_only(ex);
+            ggml_cuda_mmb_mark_half_alloc(ex);
         }
     }
 
@@ -5172,7 +5179,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 if (t->op == GGML_OP_MUL_MAT_ID && t->src[1] == glu && ggml_cuda_mmb_supported_mmid(t->src[0], t->src[1], t->src[2], t)) continue;
                 ok = false;
             }
-            if (ok && nread > 0) ggml_cuda_mmb_mark_bf16_only(glu);
+            if (ok && nread > 0) ggml_cuda_mmb_mark_half_alloc(glu);
         }
     }
 
