@@ -744,6 +744,15 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     const int K = (int) src0->ne[0], M = (int) src0->ne[1];
     const int T = (int) (src1->ne[1] * src1->ne[2] * src1->ne[3]);
     if (src0->type == GGML_TYPE_F32) {
+        // a short output (the hyper-connection mixer: 24 rows over K = 10240) wastes 104 of every 128 tile rows and
+        // launches only T/128 workgroups; a 32x64 tile keeps the same k order per element with 4x less padding and
+        // twice the workgroups. LLAMA_MMB_F32_SMALLM=0 keeps the 128x128 tile.
+        static const bool small_m = [] { const char * e = getenv("LLAMA_MMB_F32_SMALLM"); return !e || atoi(e) != 0; }();
+        if (small_m && M <= 32) {
+            dim3 grid_s(1, (T + 63) / 64);
+            mmb_f32split_kernel<32, 64, 16, 16, true><<<grid_s, MMB_NT, 0, stream>>>((const float *) src0->data, (const float *) src1->data, (float *) dst->data, M, K, T);
+            CUDA_CHECK(cudaGetLastError()); return;
+        }
         dim3 grid((M + 127) / 128, (T + 127) / 128);
         static const bool two = true;
         if (two) mmb_f32split_kernel<128, 128, 32, 64, true ><<<grid, MMB_NT, 0, stream>>>((const float *) src0->data, (const float *) src1->data, (float *) dst->data, M, K, T);
