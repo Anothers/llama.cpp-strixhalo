@@ -2550,6 +2550,12 @@ common_speculative_init_result::common_speculative_init_result(
 
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
+    // LLAMA_SPEC_DRAFT_UBATCH: a smaller micro-batch for the draft context. Its compute buffer scales with n_ubatch
+    // (1.8 GB at 8192, 6.7 GB at 32768 for the qwen4exp MTP head) and the target's prefill batches are split to it.
+    if (const char * e = getenv("LLAMA_SPEC_DRAFT_UBATCH")) {
+        const int ub = atoi(e);
+        if (ub > 0 && (uint32_t) ub < cparams.n_ubatch) { cparams.n_ubatch = ub; }
+    }
 
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
     //       the extra memory for small models is likely negligible?
