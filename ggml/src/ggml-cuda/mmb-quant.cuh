@@ -311,6 +311,33 @@ __device__ __forceinline__ void mmb_dq_q4k_slice(uint4 q0, uint4 q1, uint4 meta,
 }
 
 
+// half of a Q4_K slice: 16 bytes of qs (h = 0: first, 1: second) -> values [16h, 16h+16) with the even sub-block
+// scale and [32+16h, 32+16h+16) with the odd one, i.e. u32 words out[8h..8h+7] and out[16+8h..16+8h+7]
+__device__ __forceinline__ void mmb_dq_q4k_half(uint4 qv, uint4 meta, int slice, int h, uint32_t * out) {
+    const float d = mmb_h2f((uint16_t) meta.x), dm = mmb_h2f((uint16_t)(meta.x >> 16));
+    auto byte = [&](int i) { const uint32_t word = i < 4 ? meta.y : i < 8 ? meta.z : meta.w; return (word >> (8 * (i & 3))) & 255; };
+    auto scale_min = [&](int i, float & ds, float & ms) {
+        const uint32_t sc = i < 4 ? byte(i) & 63 : (byte(i + 4) & 15) | ((byte(i - 4) >> 6) << 4);
+        const uint32_t mn = i < 4 ? byte(i + 4) & 63 : (byte(i + 4) >> 4) | ((byte(i) >> 6) << 4);
+        ds = d * sc; ms = dm * mn;
+    };
+    float d0, d1, m0, m1;
+    scale_min(2 * slice, d0, m0); scale_min(2 * slice + 1, d1, m1);
+    const uint32_t words[4] = {qv.x, qv.y, qv.z, qv.w};
+    uint32_t lo[8], hi[8];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const uint32_t q = words[j];
+        lo[2*j]     = mmb_pack2(d0 * (q & 15) - m0, d0 * ((q >> 8) & 15) - m0);
+        lo[2*j + 1] = mmb_pack2(d0 * ((q >> 16) & 15) - m0, d0 * ((q >> 24) & 15) - m0);
+        hi[2*j]     = mmb_pack2(d1 * ((q >> 4) & 15) - m1, d1 * ((q >> 12) & 15) - m1);
+        hi[2*j + 1] = mmb_pack2(d1 * ((q >> 20) & 15) - m1, d1 * (q >> 28) - m1);
+    }
+    uint4 * o0 = (uint4 *) (out + 8 * h), * o1 = (uint4 *) (out + 16 + 8 * h);
+    o0[0] = make_uint4(lo[0], lo[1], lo[2], lo[3]); o0[1] = make_uint4(lo[4], lo[5], lo[6], lo[7]);
+    o1[0] = make_uint4(hi[0], hi[1], hi[2], hi[3]); o1[1] = make_uint4(hi[4], hi[5], hi[6], hi[7]);
+}
+
 __device__ __forceinline__ void mmb_dq_q51_pair(uint4 a, uint4 b, uint4 c, uint32_t * out) {
     const uint32_t words[12] = {a.x,a.y,a.z,a.w,b.x,b.y,b.z,b.w,c.x,c.y,c.z,c.w};
 #pragma unroll

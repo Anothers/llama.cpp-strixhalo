@@ -347,7 +347,7 @@ mmb_routed_kernel(const uint8_t * __restrict__ W, const size_t expert_bytes, con
         [&](int i) { return (i < cnt) ? ids_src[r0 + i] : -1; }, D, Dh, store_f32, M, [&](int i) { return (i < cnt) ? ids_dst[r0 + i] : -1; }, m0, cnt, As, Bs);
 }
 
-template <int BM, int BN, int WTM, int WTN, int WTYPE, bool TAIL, typename XRowFn, typename DRowFn>
+template <int BM, int BN, int WTM, int WTN, int WTYPE, bool TAIL, bool SPLIT, typename XRowFn, typename DRowFn>
 __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ Wu, const size_t wrow_bytes, const int a_rows,
         const uint16_t * __restrict__ Xh, const int K, XRowFn xrow, float * __restrict__ D, uint16_t * __restrict__ Dh, const bool store_f32, const int M, DRowFn drow, const int m0,
         const int n_cols, uint16_t * Ag, uint16_t * Au, uint16_t * Bs) {
@@ -375,6 +375,15 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
                 g0[i] = *(const uint4 *)(pg); g1[i] = *(const uint4 *)(pg + 16); g2[i] = *(const uint32_t *)(pg + 32);
                 u0[i] = *(const uint4 *)(pu); u1[i] = *(const uint4 *)(pu + 16); u2[i] = *(const uint32_t *)(pu + 32);
             } else { g0[i] = g1[i] = u0[i] = u1[i] = make_uint4(0,0,0,0); g2[i] = u2[i] = 0; }
+            } else if constexpr (WTYPE == 32 + GGML_TYPE_Q4_K && SPLIT) {
+                // all 256 threads: (gate|up, row, half) = (tid / (2*BM), (tid / 2) % BM, tid & 1)
+                static_assert(4 * BM == MMB_NT, "split Q4_K dequant needs BM = 64");
+                const int srow = (tid >> 1) % BM, h = tid & 1;
+                const uint8_t * base = tid >= 2 * BM ? Wu : Wg;
+                if (srow < a_rows) {
+                    const uint8_t * pg = base + (size_t)srow * wrow_bytes + (size_t)(ks / 4) * sizeof(block_q4_K);
+                    gm[i] = *(const uint4 *)pg; g0[i] = *(const uint4 *)(pg + 16 + (ks & 3) * 32 + h * 16);
+                } else { gm[i] = g0[i] = make_uint4(0,0,0,0); }
             } else if constexpr (WTYPE == 32 + GGML_TYPE_Q4_K) {
                 if (row < BM && row < a_rows) {
                     const uint8_t * pg = Wg + (size_t)row * wrow_bytes + (size_t)(ks / 4) * sizeof(block_q4_K);
@@ -393,6 +402,11 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
         }
     };
     auto store_lds = [&]() {
+        if constexpr (WTYPE == 32 + GGML_TYPE_Q4_K && SPLIT) {
+            const int srow = (tid >> 1) % BM, h = tid & 1;
+            uint16_t * dstA = tid >= 2 * BM ? Au : Ag;
+            mmb_dq_q4k_half(g0[0], gm[0], weight_ks & 3, h, (uint32_t *)(dstA + srow * MMB_LDS_STRIDE));
+        }
         if constexpr (WTYPE != 0 && WTYPE != 32 + GGML_TYPE_Q4_K) {
             constexpr int LOAD_TYPE = WTYPE == 1 ? 32 + GGML_TYPE_Q8_0 : WTYPE;
             mmb_load_quant_tile<LOAD_TYPE, BM, MMB_LDS_STRIDE>(Wg, wrow_bytes, a_rows, weight_ks, Ag);
@@ -406,7 +420,7 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
                 if constexpr (WTYPE == 0) {
                     mmb_dq_row36(g0[i], g1[i], g2[i], (uint32_t *)(Ag + row * MMB_LDS_STRIDE));
                     mmb_dq_row36(u0[i], u1[i], u2[i], (uint32_t *)(Au + row * MMB_LDS_STRIDE));
-                } else if constexpr (WTYPE == 32 + GGML_TYPE_Q4_K) {
+                } else if constexpr (WTYPE == 32 + GGML_TYPE_Q4_K && !SPLIT) {
                     mmb_dq_q4k_slice(g0[i], g1[i], gm[i], weight_ks & 3, (uint32_t *)(Ag + row * MMB_LDS_STRIDE));
                     mmb_dq_q4k_slice(u0[i], u1[i], um[i], weight_ks & 3, (uint32_t *)(Au + row * MMB_LDS_STRIDE));
                 }
@@ -470,7 +484,7 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
 
 template <int BM_, int BN_, int WTM_, int WTN_> struct mmb_tile { static constexpr int BM = BM_, BN = BN_, WTM = WTM_, WTN = WTN_; };
 
-template <int BM, int BN, int WTM, int WTN, int WTYPE = 0>
+template <int BM, int BN, int WTM, int WTN, int WTYPE = 0, bool SPLIT = false>
 __global__ void __launch_bounds__(MMB_NT, 2)
 mmb_routed_glu_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ Wu, const size_t expert_bytes, const uint16_t * __restrict__ Xh,
         float * __restrict__ D, uint16_t * __restrict__ Dh, const bool store_f32,
@@ -485,7 +499,7 @@ mmb_routed_glu_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restric
     const int r0 = bounds[e] + jt * BN, cnt = bounds[e + 1] - r0;
     const int m0 = blockIdx.x * BM;
     const size_t wrow_bytes = mmb_row_bytes<WTYPE>(K);
-    mmb_tile_gemm_glu<BM, BN, WTM, WTN, WTYPE, true>(Wg + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, Wu + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
+    mmb_tile_gemm_glu<BM, BN, WTM, WTN, WTYPE, true, SPLIT>(Wg + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, Wu + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
         [&](int i) { return (i < cnt) ? ids_src[r0 + i] : -1; }, D, Dh, store_f32, M, [&](int i) { return (i < cnt) ? ids_dst[r0 + i] : -1; }, m0, cnt, Ag, Au, Bs);
 }
 
@@ -1017,8 +1031,13 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
         dim3 gbig((M + TB::BM - 1) / TB::BM, nbig_max), gsmall((M + TS::BM - 1) / TS::BM, nsmall_max);
         mmb_dispatch_quant(gw->type, [&](auto tag) {
             constexpr int WT = decltype(tag)::value;
-            mmb_routed_glu_kernel<TB::BM, TB::BN, TB::WTM, TB::WTN, WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
-            mmb_routed_glu_kernel<TS::BM, TS::BN, TS::WTM, TS::WTN, WT><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
+            // LLAMA_MMB_Q4K_SPLIT=0: only BM of the 256 threads dequantize (the original path)
+            static const bool split = [] { const char * e = getenv("LLAMA_MMB_Q4K_SPLIT"); return !e || atoi(e) != 0; }();
+            constexpr bool can_b = WT == 32 + GGML_TYPE_Q4_K && TB::BM == 64, can_s = WT == 32 + GGML_TYPE_Q4_K && TS::BM == 64;
+            if (split && can_b) mmb_routed_glu_kernel<TB::BM, TB::BN, TB::WTM, TB::WTN, WT, can_b><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
+            else mmb_routed_glu_kernel<TB::BM, TB::BN, TB::WTM, TB::WTN, WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
+            if (split && can_s) mmb_routed_glu_kernel<TS::BM, TS::BN, TS::WTM, TS::WTN, WT, can_s><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
+            else mmb_routed_glu_kernel<TS::BM, TS::BN, TS::WTM, TS::WTN, WT><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
         });
     };
     switch (cfg) {
