@@ -594,6 +594,8 @@ static const uint16_t * mmb_bf16_activation(ggml_backend_cuda_context & ctx, con
     const ggml_tensor * root = mmb_root(src1);
     for (auto & e : g_mmb_slots) if (e.buf && e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
     for (auto & e : g_mmb_cache) if (e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
+    // a producer marked BF16-only (e.g. the fused gated norm) already wrote BF16 into the tensor's own buffer
+    if (ggml_cuda_mmb_is_bf16_only(root) && src1->data == root->data && ggml_is_contiguous(src1) && ggml_nelements(root) == (int64_t) n) return (const uint16_t *) src1->data;
     uint16_t * buf = mmb_cache_insert(ctx, src1, n);
     mmb_cvt_f32_bf16<<<(unsigned)((n / 8 + 255) / 256), 256, 0, stream>>>((const float *) src1->data, buf, n);
     return buf;
@@ -642,6 +644,44 @@ __global__ void mmb_dq_iq4nl_bf16_kernel(const uint8_t * __restrict__ W, uint16_
         o[2*w] = mmb_pack2(l0, l1); o[2*w + 1] = mmb_pack2(l2, l3); o[8 + 2*w] = mmb_pack2(h0, h1); o[8 + 2*w + 1] = mmb_pack2(h2, h3);
     }
 }
+
+// M <= 8 (HC inject 4 x 10240): pure stream of the activations. Each wave owns TPW tokens, lanes stride K with float4
+// loads of x and of the (L2-resident) weight rows, then a shuffle reduction.
+template <int MP, int TPW>
+static __global__ void __launch_bounds__(256)
+mmb_f32stream_kernel(const float * __restrict__ W, const float * __restrict__ X, float * __restrict__ D, const int M, const int K, const int T) {
+    constexpr int WS = 32;
+    const int lane = threadIdx.x % WS, wave = threadIdx.x / WS;
+    const int t0 = (blockIdx.x * (256 / WS) + wave) * TPW;
+    if (t0 >= T) return;
+    float acc[MP][TPW] = {};
+    for (int k = lane * 4; k < K; k += WS * 4) {
+        float4 x[TPW], w[MP];
+#pragma unroll
+        for (int b = 0; b < TPW; ++b) x[b] = t0 + b < T ? *(const float4 *) (X + (size_t) (t0 + b) * K + k) : make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+        for (int a = 0; a < MP; ++a) w[a] = a < M ? *(const float4 *) (W + (size_t) a * K + k) : make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+        for (int a = 0; a < MP; ++a)
+#pragma unroll
+            for (int b = 0; b < TPW; ++b) acc[a][b] += w[a].x * x[b].x + w[a].y * x[b].y + w[a].z * x[b].z + w[a].w * x[b].w;
+    }
+#pragma unroll
+    for (int a = 0; a < MP; ++a)
+#pragma unroll
+        for (int b = 0; b < TPW; ++b) {
+            float v = acc[a][b];
+#pragma unroll
+            for (int o = WS / 2; o > 0; o >>= 1) v += __shfl_xor(v, o, WS);
+            acc[a][b] = v;
+        }
+    if (lane == 0) {
+#pragma unroll
+        for (int b = 0; b < TPW; ++b)
+#pragma unroll
+            for (int a = 0; a < MP; ++a) if (a < M && t0 + b < T) D[(size_t) (t0 + b) * M + a] = acc[a][b];
+    }
+}
 static std::unordered_map<const void *, uint16_t *> g_mmb_shadow;
 static std::map<std::pair<const void *, const void *>, uint16_t *> g_mmb_shadow_pair;   // concat(w0, w1) along rows -> BF16 copy
 static size_t g_mmb_shadow_bytes = 0;
@@ -667,6 +707,22 @@ static __global__ void mmb_dq_q8_0_bf16_kernel(const uint8_t * __restrict__ src,
         const uint32_t u = __float_as_uint(v);
         dst[b * 32 + i] = (uint16_t) ((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);   // round to nearest even
     }
+}
+// coalesced Q8_0 -> bf16: one thread per 8 values (a quarter block), 16-byte stores
+static __global__ void mmb_dq_q8_0_bf16_x8(const uint8_t * __restrict__ src, uint16_t * __restrict__ dst, const size_t nq) {
+    const size_t q = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= nq) return;
+    const uint8_t * blk = src + (q >> 2) * 34;
+    const float d = (float) __builtin_bit_cast(_Float16, *(const uint16_t *) blk);
+    const uint16_t * qs = (const uint16_t *) (blk + 2 + (q & 3) * 8);
+    uint32_t o[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint16_t v = qs[i];
+        const uint32_t a = __float_as_uint(d * (float) (int8_t) (v & 0xff)), b = __float_as_uint(d * (float) (int8_t) (v >> 8));
+        o[i] = ((a + 0x7fffu + ((a >> 16) & 1u)) >> 16) | (((b + 0x7fffu + ((b >> 16) & 1u)) >> 16) << 16);
+    }
+    *(uint4 *) (dst + q * 8) = make_uint4(o[0], o[1], o[2], o[3]);
 }
 static bool mmb_is_resident_iq4(const ggml_tensor * w) { return w && w->type == GGML_TYPE_IQ4_NL && w->op == GGML_OP_NONE && w->data && w->buffer && w->ne[2] == 1 && w->ne[3] == 1 && ggml_is_contiguous(w); }
 static bool mmb_is_row_concat(const ggml_tensor * w) {
@@ -765,12 +821,25 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     const int K = (int) src0->ne[0], M = (int) src0->ne[1];
     const int T = (int) (src1->ne[1] * src1->ne[2] * src1->ne[3]);
     if (src0->type == GGML_TYPE_F32) {
+        static const bool dbgf = [] { const char * e = getenv("LLAMA_MMB_SHAPES"); return e && atoi(e) != 0; }();
+        if (dbgf) fprintf(stderr, "mmb_shape f32 M=%d K=%d T=%d w=%s src1=%s\n", M, K, T, src0->name, src1->name);
+        static const bool skinny = [] { const char * e = getenv("LLAMA_MMB_F32SKINNY"); return !e || atoi(e) != 0; }();
+        if (skinny && M <= 4 && K % 128 == 0 && ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
+            static const int tpw = [] { const char * e = getenv("LLAMA_MMB_F32STREAM_TPW"); return e ? atoi(e) : 2; }();
+            const float * Wf = (const float *) src0->data, * Xf = (const float *) src1->data; float * Df = (float *) dst->data;
+            if (tpw == 2)      mmb_f32stream_kernel<4, 2><<<(T + 15) / 16, 256, 0, stream>>>(Wf, Xf, Df, M, K, T);
+            else if (tpw == 8) mmb_f32stream_kernel<4, 8><<<(T + 63) / 64, 256, 0, stream>>>(Wf, Xf, Df, M, K, T);
+            else               mmb_f32stream_kernel<4, 4><<<(T + 31) / 32, 256, 0, stream>>>(Wf, Xf, Df, M, K, T);
+            CUDA_CHECK(cudaGetLastError()); return;
+        }
         dim3 grid((M + 127) / 128, (T + 127) / 128);
         static const bool two = true;
         if (two) mmb_f32split_kernel<128, 128, 32, 64, true ><<<grid, MMB_NT, 0, stream>>>((const float *) src0->data, (const float *) src1->data, (float *) dst->data, M, K, T);
         else     mmb_f32split_kernel<128, 128, 32, 64, false><<<grid, MMB_NT, 0, stream>>>((const float *) src0->data, (const float *) src1->data, (float *) dst->data, M, K, T);
         CUDA_CHECK(cudaGetLastError()); return;
     }
+    static const bool dbg = [] { const char * e = getenv("LLAMA_MMB_SHAPES"); return e && atoi(e) != 0; }();
+    if (dbg) fprintf(stderr, "mmb_shape dense %s M=%d K=%d T=%d w=%s bf16only=%d\n", ggml_type_name(src0->type), M, K, T, src0->name, (int) ggml_cuda_mmb_is_bf16_only(dst));
     const uint16_t * xhp = mmb_bf16_activation(ctx, src1, (size_t) T * K, stream);
     const uint8_t * W = (const uint8_t *) src0->data; float * D = (float *) dst->data;
     // tall-M tile: HC down|inject [10240 -> 324], activations read once. The UD GGUFs keep hc_*_down at Q8_0, which
@@ -779,7 +848,7 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     if (mmb_tall() && (src0->type == GGML_TYPE_IQ4_NL || (tall_q8 && src0->type == GGML_TYPE_Q8_0)) && M <= 384 && K >= 4096 && T >= 2048) {
         static const int wide = mmb_tall_mode() >= 2;
         const uint16_t * tall_shadow = src0->type == GGML_TYPE_Q8_0 ? mmb_shadow_lookup(src0) : nullptr;
-        if (tall_shadow && ggml_cuda_hblt_gemm_bf16(ctx, tall_shadow, xhp, D, M, K, T, stream)) {
+        if (tall_shadow && ggml_cuda_hblt_gemm_f32out(ctx, tall_shadow, xhp, D, M, K, T, stream)) {
             CUDA_CHECK(cudaGetLastError());
             return;
         }
@@ -803,6 +872,18 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     bool store_f32 = !(Dh && ggml_cuda_mmb_is_bf16_only(dst));
     if (ggml_cuda_mmb_blk16() && !Dh && ggml_cuda_mmb_is_bf16_only(dst) && (M & 7) == 0) {
         Dh = (uint16_t *) dst->data; store_f32 = false;
+    }
+    // hipBLASLt on a bf16 copy of a Q8_0 weight dequantized for this call (the copy stays in the 32 MB MALL for the
+    // GEMM): 1 = only when the consumer reads the bf16 result (no widening pass), 2 = every dense Q8_0 matmul
+    static const int hblt_dense = [] { const char * e = getenv("GGML_CUDA_HBLT_DENSE"); return e ? atoi(e) : 0; }();
+    if (hblt_dense > 0 && src0->type == GGML_TYPE_Q8_0 && ggml_is_contiguous(src0) && K % 32 == 0 && T >= 1024 && M >= 4096 &&
+        ((Dh && !store_f32 && Dh == dst->data) || (hblt_dense >= 2 && store_f32 && !Dh))) {
+        ggml_cuda_pool_alloc<uint16_t> wb(ctx.pool(), (size_t) M * K);
+        const size_t nq = (size_t) M * K / 8;
+        mmb_dq_q8_0_bf16_x8<<<(unsigned) ((nq + 255) / 256), 256, 0, stream>>>(W, wb.get(), nq);
+        const bool ok = store_f32 ? ggml_cuda_hblt_gemm_f32out(ctx, wb.get(), xhp, D, M, K, T, stream)
+                                  : ggml_cuda_hblt_gemm(ctx, wb.get(), xhp, Dh, true, M, K, T, stream);
+        if (ok) { CUDA_CHECK(cudaGetLastError()); return; }
     }
     dim3 grid((M + 127) / 128, big ? (T + 255) / 256 : (T + 127) / 128);
     const uint16_t * shadow = shadow_pre;

@@ -5057,6 +5057,63 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 if (ok && nread > 0) ggml_cuda_mmb_mark_bf16_only(d);
             }
 
+            // GDN gated norm: BF16 gate (z projection read only by the fused sigmoid) and BF16 output (read only by mmb matmuls)
+            static const bool ng16 = [] { const char * e = getenv("GGML_CUDA_NORMGATE16"); return !e || atoi(e) != 0; }();
+            for (int i = 0; ng16 && i < cgraph->n_nodes; ++i) {
+                if (cgraph->nodes[i]->op != GGML_OP_RMS_NORM) continue;
+                ggml_cuda_norm_gated_match nm;
+                const int sk = ggml_cuda_norm_gated_match_at(cgraph, i, nm);
+                if (sk <= 0 || !nm.z) continue;
+                const ggml_tensor * zr = nm.z->view_src ? nm.z->view_src : nm.z;
+                if (zr->op == GGML_OP_MUL_MAT && zr->src[0]->type != GGML_TYPE_F32 && ggml_cuda_mmb_supported_mm(zr->src[0], zr->src[1], zr) &&
+                    ggml_nrows(zr) >= 512 && zr->ne[0] % 8 == 0 && nm.z->view_offs == 0 && ggml_nelements(nm.z) == ggml_nelements(zr)) {
+                    const ggml_tensor * sig = cgraph->nodes[i + sk - 1];   // the sigmoid
+                    bool ok = true;
+                    for (int n = 0; n < cgraph->n_nodes && ok; ++n) {
+                        const ggml_tensor * t = cgraph->nodes[n];
+                        if (t == zr || !reads(t, zr)) continue;
+                        if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE) { if (t == nm.z) continue; }
+                        if (t == sig) continue;
+                        ok = false;
+                    }
+                    if (ok) ggml_cuda_mmb_mark_bf16_only(zr);
+                }
+                const ggml_tensor * d = nm.dst;
+                if (ggml_nrows(d) >= 512) {
+                    bool ok = true; int nread = 0;
+                    for (int n = i + sk + 1; n < cgraph->n_nodes && ok; ++n) {
+                        const ggml_tensor * t = cgraph->nodes[n];
+                        if (!reads(t, d)) continue;
+                        ++nread;
+                        if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE) { if (t->view_offs == 0 && ggml_is_contiguous(t)) continue; ok = false; break; }
+                        if (t->op == GGML_OP_MUL_MAT && t->src[0]->type != GGML_TYPE_F32 && ggml_is_contiguous(t->src[1]) &&
+                            ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t)) continue;
+                        ok = false;
+                    }
+                    if (ok && nread > 0) ggml_cuda_mmb_mark_bf16_only(d);
+                }
+            }
+
+            // GDN qkv projection: read only by the fused concat-tail + conv pair, which take a BF16 input
+            static const bool gdn_x16 = [] { const char * e = getenv("GGML_CUDA_GDN_X16"); return !e || atoi(e) != 0; }();
+            for (int i = 0; gdn_x16 && i < cgraph->n_nodes; ++i) {
+                if (cgraph->nodes[i]->op != GGML_OP_CONCAT) continue;
+                ggml_cuda_gdn_conv_match gm;
+                if (!ggml_cuda_gdn_conv_match_at_concat(cgraph, i, gm)) continue;
+                const ggml_tensor * x = gm.x;
+                if (x->op != GGML_OP_MUL_MAT || x->src[0]->type == GGML_TYPE_F32 || !ggml_cuda_mmb_supported_mm(x->src[0], x->src[1], x)) continue;
+                if (ggml_nrows(x) < 512 || x->ne[0] % 8 != 0) continue;
+                bool ok = true;
+                for (int n = 0; n < cgraph->n_nodes && ok; ++n) {
+                    const ggml_tensor * t = cgraph->nodes[n];
+                    if (t == x || !reads(t, x)) continue;
+                    if (n == gm.concat_idx) continue;
+                    if (t->op == GGML_OP_TRANSPOSE && t->view_src == x) continue;
+                    ok = false;
+                }
+                if (ok) ggml_cuda_mmb_mark_bf16_only(x);
+            }
+
             for (int i = 0; i < cgraph->n_nodes; ++i) {
                 const ggml_tensor * t = cgraph->nodes[i];
                 if (t->op != GGML_OP_MUL_MAT || t->src[0]->ne[0] != 320 || t->src[0]->ne[1] != 10240 || !ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t)) continue;

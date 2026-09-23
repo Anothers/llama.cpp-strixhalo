@@ -1,4 +1,5 @@
 #include "norm-gated.cuh"
+#include "mmb.cuh"
 #include "ggml-impl.h"
 #include <cstdlib>
 #include <cstdio>
@@ -13,7 +14,10 @@ static __device__ __forceinline__ float xor_tree(float v) {
     for (int off = 16; off > 0; off >>= 1) { v += __shfl_xor(v, off); }
     return v;
 }
-template <bool GATE>
+// Z16 / O16: the gate z and/or the output are BF16 (the gate projection's matmul wrote BF16, the output projection's
+// matmul reads BF16), marked in graph_optimize when those are the only readers.
+static __device__ __forceinline__ uint16_t nrm_f2bf(const float f) { const uint32_t u = __float_as_uint(f); return (uint16_t) ((u + 0x7fffu + ((u >> 16) & 1u)) >> 16); }
+template <bool GATE, bool Z16 = false, bool O16 = false>
 static __global__ void __launch_bounds__(256) rms_rows_f32(const float * x, const float * w, const float * z, float * dst,
         const int ncols, const int64_t nrows, const int64_t nchannels, const int64_t total_rows,
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps) {
@@ -22,6 +26,8 @@ static __global__ void __launch_bounds__(256) rms_rows_f32(const float * x, cons
     if (g >= total_rows) return;
     const int64_t row = g % nrows, channel = (g / nrows) % nchannels, sample = g / (nrows * nchannels);
     x += sample * stride_sample + channel * stride_channel + row * stride_row;
+    // BF16 z / dst advance in 2-byte elements, F32 in 4-byte ones
+    uint16_t * dst16 = (uint16_t *) dst + g * ncols; const uint16_t * z16 = GATE ? (const uint16_t *) z + g * ncols : nullptr;
     dst += g * ncols; if (GATE) z += g * ncols;
     float part[8];
 #pragma unroll
@@ -41,7 +47,12 @@ static __global__ void __launch_bounds__(256) rms_rows_f32(const float * x, cons
         const int col = 32 * wv + lane;
         if (col < ncols) {
             const float t = scale * x[col] * w[col];
-            if (GATE) { const float s = 1.0f / (1.0f + expf(-z[col])); dst[col] = t * s; } else { dst[col] = t; }
+            float o = t;
+            if (GATE) {
+                const float zv = Z16 ? __uint_as_float((uint32_t) z16[col] << 16) : z[col];
+                o = t * (1.0f / (1.0f + expf(-zv)));
+            }
+            if (O16) dst16[col] = nrm_f2bf(o); else dst[col] = o;
         }
     }
 }
@@ -105,6 +116,14 @@ void ggml_cuda_op_norm_gated(ggml_backend_cuda_context & ctx, const ggml_cuda_no
     const int64_t total = x->ne[1] * x->ne[2] * x->ne[3];
     const dim3 grid((unsigned) ((total + 7) / 8)), block(256);
     const ggml_cuda_kernel_launch_params lp(grid, block, 0, ctx.stream());
+    const bool z16 = m.z && ggml_cuda_mmb_is_bf16_only(m.z->view_src ? m.z->view_src : m.z);
+    const bool o16 = m.z && ggml_cuda_mmb_is_bf16_only(m.dst);
+    if (z16 || o16) {
+        auto k = z16 ? (o16 ? rms_rows_f32<true, true, true> : rms_rows_f32<true, true, false>) : rms_rows_f32<true, false, true>;
+        ggml_cuda_kernel_launch(k, lp, (const float *) x->data, (const float *) m.w->data, (const float *) m.z->data, (float *) m.dst->data,
+            (int) x->ne[0], x->ne[1], x->ne[2], total, (int64_t) (x->nb[1] / 4), (int64_t) (x->nb[2] / 4), (int64_t) (x->nb[3] / 4), m.eps);
+        return;
+    }
     if (m.z) ggml_cuda_kernel_launch(rms_rows_f32<true>, lp, (const float *) x->data, (const float *) m.w->data, (const float *) m.z->data, (float *) m.dst->data,
         (int) x->ne[0], x->ne[1], x->ne[2], total, (int64_t) (x->nb[1] / 4), (int64_t) (x->nb[2] / 4), (int64_t) (x->nb[3] / 4), m.eps);
     else     ggml_cuda_kernel_launch(rms_rows_f32<false>, lp, (const float *) x->data, (const float *) m.w->data, (const float *) nullptr, (float *) m.dst->data,

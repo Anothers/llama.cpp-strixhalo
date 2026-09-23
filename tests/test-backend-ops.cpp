@@ -11430,6 +11430,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   640, T, 2560, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  2560, T,  640, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   320, T, 10240, {1, 1}, {1, 1}));
+        // f32 weights: hc_*_inject, ssm_alpha/beta, router
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32,   4, T, 10240, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32,  48, T,  2560, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 512, T,  2560, {1, 1}, {1, 1}));
     }
     for (int kv : {2048, 40704, 40960, 101120, 101376}) {
         for (int width : {1, 2, 3}) {
