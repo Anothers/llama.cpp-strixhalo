@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "argsort.cuh"
 #include "top-k.cuh"
 
@@ -518,10 +519,133 @@ static __global__ void top_k_radix_select_cuda(
     }
 }
 
+// Wide rows (QSA indexer: 32K-57K key blocks, k = 512): one 12-bit histogram pass over global memory picks the
+// threshold bucket with a parallel suffix scan, the bucket's members are compacted into LDS and the remaining
+// 20 bits are resolved there in two 10-bit passes. Everything above the bucket is emitted during compaction.
+// Rows whose threshold bucket holds more than CAP members (e.g. mostly -inf rows) fall back to the 8-bit loop.
+// Ties at the threshold take the lowest columns, as top_k_gather_equal does.
+template<int BLOCK_SIZE>
+static __device__ __forceinline__ void top_k_block_suffix_find(const uint32_t * hist, const int nbins, const uint32_t desired,
+        uint32_t * wsum, uint32_t & s_bucket, uint32_t & s_above) {
+    // thread t owns bins [nbins - PER*(t+1), nbins - PER*t), i.e. t = 0 holds the highest bins
+    const int per = nbins / BLOCK_SIZE;
+    const int tid = threadIdx.x, lane = tid % warpSize, warp = tid / warpSize;
+    const int hi = nbins - per * tid;
+    uint32_t local = 0;
+    for (int j = 1; j <= per; ++j) local += hist[hi - j];
+    uint32_t incl = local;
+#pragma unroll
+    for (int o = 1; o < 64; o <<= 1) { if (o >= warpSize) break; const uint32_t v = __shfl_up(incl, o, warpSize); if (lane >= o) incl += v; }
+    if (lane == warpSize - 1) wsum[warp] = incl;
+    __syncthreads();
+    uint32_t woff = 0;
+    for (int w = 0; w < warp; ++w) woff += wsum[w];
+    uint32_t above = woff + incl - local;
+    if (above < desired && above + local >= desired) {
+        for (int j = 1; j <= per; ++j) {
+            const uint32_t c = hist[hi - j];
+            if (above + c >= desired) { s_bucket = (uint32_t) (hi - j); s_above = above; break; }
+            above += c;
+        }
+    }
+    __syncthreads();
+}
+
+template<int BLOCK_SIZE>
+static __global__ void top_k_radix2_cuda(const float * __restrict__ src, int * __restrict__ dst, int ncols, int nrows, int k) {
+    constexpr int NB1 = 4096, CAP = 4096;
+    __shared__ uint32_t hist[NB1];
+    __shared__ uint32_t ckey[CAP];
+    __shared__ int      cidx[CAP];
+    __shared__ uint32_t wsum[32];
+    __shared__ uint32_t s_bucket, s_above, s_cnt, s_out;
+    const int tid = threadIdx.x;
+    for (int row = blockIdx.x; row < nrows; row += gridDim.x) {
+        const float * row_src = src + (size_t) row * ncols;
+        int * row_dst = dst + (size_t) row * k;
+        for (int b = tid; b < NB1; b += BLOCK_SIZE) hist[b] = 0;
+        if (tid == 0) { s_bucket = 0; s_above = 0; s_cnt = 0; s_out = 0; }
+        __syncthreads();
+        for (int col = tid; col < ncols; col += BLOCK_SIZE) atomicAdd(&hist[top_k_float_to_ordered(row_src[col]) >> 20], 1U);
+        __syncthreads();
+        top_k_block_suffix_find<BLOCK_SIZE>(hist, NB1, (uint32_t) k, wsum, s_bucket, s_above);
+        static_assert(BLOCK_SIZE == 1024, "the suffix searches assume one bin (or four) per thread");
+        const uint32_t b1 = s_bucket;
+        uint32_t desired = (uint32_t) k - s_above;
+        const uint32_t cnt = hist[b1];
+        __syncthreads();
+        if (cnt > CAP) {
+            // too many members in the threshold bucket: the original 8-bit radix loop over global memory
+            uint32_t prefix = 0; uint32_t want = k;
+            for (int shift = 24; shift >= 0; shift -= 8) {
+                for (int b = tid; b < 1024; b += BLOCK_SIZE) hist[b] = 0;   // the suffix search scans 1024 bins
+                __syncthreads();
+                const uint32_t high_mask = shift == 24 ? 0 : 0xffffffffU << (shift + 8);
+                const uint32_t prefix_high = prefix & high_mask;
+                for (int col = tid; col < ncols; col += BLOCK_SIZE) {
+                    const uint32_t key = top_k_float_to_ordered(row_src[col]);
+                    if ((key & high_mask) == prefix_high) atomicAdd(&hist[(key >> shift) & 255], 1U);
+                }
+                __syncthreads();
+                top_k_block_suffix_find<BLOCK_SIZE>(hist, 1024, want, wsum, s_bucket, s_above);
+                prefix |= s_bucket << shift; want -= s_above;
+                __syncthreads();
+            }
+            if (tid == 0) s_out = 0;
+            __syncthreads();
+            for (int col = tid; col < ncols; col += BLOCK_SIZE) if (top_k_float_to_ordered(row_src[col]) > prefix) row_dst[atomicAdd(&s_out, 1U)] = col;
+            __syncthreads();
+            top_k_gather_equal<BLOCK_SIZE>(row_src, row_dst, ncols, prefix, want, s_out);
+            __syncthreads();
+            continue;
+        }
+        // compaction: above the bucket -> output, in the bucket -> LDS
+        for (int col = tid; col < ncols; col += BLOCK_SIZE) {
+            const uint32_t key = top_k_float_to_ordered(row_src[col]);
+            const uint32_t bk = key >> 20;
+            if (bk > b1) row_dst[atomicAdd(&s_out, 1U)] = col;
+            else if (bk == b1) { const uint32_t p = atomicAdd(&s_cnt, 1U); ckey[p] = key; cidx[p] = col; }
+        }
+        __syncthreads();
+        uint32_t prefix = b1 << 20;
+        for (int shift = 10; shift >= 0; shift -= 10) {
+            for (int b = tid; b < 1024; b += BLOCK_SIZE) hist[b] = 0;
+            __syncthreads();
+            const uint32_t high_mask = 0xffffffffU << (shift + 10);
+            const uint32_t prefix_high = prefix & high_mask;
+            for (uint32_t i = tid; i < cnt; i += BLOCK_SIZE) {
+                const uint32_t key = ckey[i];
+                if ((key & high_mask) == prefix_high) atomicAdd(&hist[(key >> shift) & 1023], 1U);
+            }
+            __syncthreads();
+            top_k_block_suffix_find<BLOCK_SIZE>(hist, 1024, desired, wsum, s_bucket, s_above);
+            prefix |= s_bucket << shift; desired -= s_above;
+            __syncthreads();
+        }
+        // prefix is the exact threshold key; desired members equal to it are still owed
+        uint32_t neq = 0;
+        for (uint32_t i = 0; i < cnt; ++i) neq += ckey[i] == prefix;   // uniform loop, LDS broadcast reads
+        for (uint32_t i = tid; i < cnt; i += BLOCK_SIZE) if (ckey[i] > prefix) row_dst[atomicAdd(&s_out, 1U)] = cidx[i];
+        __syncthreads();
+        if (neq == desired) {
+            for (uint32_t i = tid; i < cnt; i += BLOCK_SIZE) if (ckey[i] == prefix) row_dst[atomicAdd(&s_out, 1U)] = cidx[i];
+        } else {
+            top_k_gather_equal<BLOCK_SIZE>(row_src, row_dst, ncols, prefix, desired, s_out);
+        }
+        __syncthreads();
+    }
+}
+
 static void top_k_radix_select_cuda(
         const float * src, int * dst, int ncols, int nrows, int k, cudaStream_t stream) {
     constexpr int BLOCK_SIZE = 1024;
     const int grid_size = std::min(nrows, 65535);
+    // GGML_CUDA_TOPK_RADIX2=0 keeps the 8-bit loop for every row
+    static const bool radix2 = [] { const char * e = getenv("GGML_CUDA_TOPK_RADIX2"); return !e || atoi(e) != 0; }();
+    if (radix2 && ncols >= 4096) {
+        top_k_radix2_cuda<BLOCK_SIZE><<<grid_size, BLOCK_SIZE, 0, stream>>>(src, dst, ncols, nrows, k);
+        return;
+    }
     top_k_radix_select_cuda<BLOCK_SIZE><<<grid_size, BLOCK_SIZE, 0, stream>>>(src, dst, ncols, nrows, k);
 }
 

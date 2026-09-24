@@ -10883,6 +10883,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // many wide rows (the per-row radix kernels: QSA indexer strips of 512 queries over 32K-57K key blocks)
+    for (int n : {4096, 32768, 56832}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {n, 300, 1, 1}, 512));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {n, 300, 1, 1}, 512, true));
+    }
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {8192, 260, 1, 1}, 2051));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {8192, 260, 1, 1}, 2051, true));
+
     for (int k : {1, 2, 3, 7, 15}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {16, 10, 10, 10}, k));
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {60, 10, 10, 10}, k));
@@ -11391,6 +11399,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 32, 4, 1, type_K));
         }
     }
+    // 4 heads (qwen4exp QSA, the WMMA path), ragged query and key counts
+    for (int kv : { 64, 1000, 4096 }) {
+        for (int bs : { 16, 130, 600 }) {
+            for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+                test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, bs, 1, 1, type_K));
+            }
+        }
+    }
 
     for (int tokens : {128, 511, 512, 513, 1024}) {
         for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
@@ -11866,6 +11882,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
 
+    // qwen4exp QSA indexer top-k over the block scores of a 512-query strip
+    for (int n : {8192, 32768, 56832}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {n, 512, 1, 1}, 512));
+    }
+    // qwen4exp QSA indexer: 512-query strip, 4 heads, key blocks at 32K / 131K / 227K context (r = 4)
+    for (int kv : { 8192, 32768, 56832 }) {
+        test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, 512, 1, 1, GGML_TYPE_F32));
+    }
     // lightning_indexer
     for (int kv : { 256, 4096, 65536 }) {
         for (int bs : { 1, 512, 2048 }) {

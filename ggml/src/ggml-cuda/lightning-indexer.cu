@@ -1,3 +1,5 @@
+#include <type_traits>
+#include <cstdlib>
 #include "common.cuh"
 #include "lightning-indexer.cuh"
 #include "mma.cuh"
@@ -592,9 +594,12 @@ static bool ggml_cuda_lightning_indexer_generic_supported(int device, const ggml
 struct indexer_layout {
     size_t q1, q2, q3, k2, k3, w1, w3, m1, m3, d1, d3;
     int nq, nk, nm;
+    bool q_vec4;   // q rows 16-byte aligned: float4 loads
 };
 
-template <typename K>
+// QT: 16-query tiles walked per block with the 64 keys held in registers (QT = 1 is the original one-tile block,
+// which re-read and re-converted the keys for every 16 queries)
+template <typename K, int QT>
 __global__ __launch_bounds__(128) void qsa_indexer_wmma16_keyreg(
         const char * q, const char * k, const char * w, const char * mask,
         char * dst, indexer_layout s, const int * lim, const int lim_t) {
@@ -603,20 +608,8 @@ __global__ __launch_bounds__(128) void qsa_indexer_wmma16_keyreg(
     using AB=tile<16,8,half2,DATA_LAYOUT_I_MAJOR_MIRRORED>;
     using C=tile<16,16,float,DATA_LAYOUT_J_MAJOR>;
     const int warp=threadIdx.y,lane=threadIdx.x,tid=warp*32+lane;
-    const int qfirst=int(blockIdx.y)*16,kfirst=int(blockIdx.x)*64,stream=blockIdx.z;
+    const int kfirst=int(blockIdx.x)*64,stream=blockIdx.z;
     __shared__ half2 query_tile[16][260];
-#pragma unroll 1
-    for(int i=tid;i<16*128;i+=128) {
-        const int row=i/128,col=4*(i%128),token=qfirst+row;
-        float4 value=make_float4(0,0,0,0);
-        if(token<s.nq) {
-            const float * src=(const float *)(q+size_t(stream)*s.q3+size_t(token)*s.q2+size_t(col/128)*s.q1);
-            const int d=col%128;
-            value=make_float4(src[d],src[d+1],src[d+2],src[d+3]);
-        }
-        query_tile[row][col/2]=__float22half2_rn(make_float2(value.x,value.y));
-        query_tile[row][col/2+1]=__float22half2_rn(make_float2(value.z,value.w));
-    }
     AB keys[8];
 #pragma unroll
     for(int part=0;part<8;++part) {
@@ -631,7 +624,35 @@ __global__ __launch_bounds__(128) void qsa_indexer_wmma16_keyreg(
             keys[part].x[l]=__float22half2_rn(value);
         }
     }
+    // the next 16-query tile is fetched into registers (fully unrolled, 16-byte loads when aligned) while the current
+    // one is multiplied; the old loop issued 4 scalar loads per iteration under unroll 1, a serial latency chain
+    float4 pre[16];
+    auto fetch=[&](const int qfirst) {
+#pragma unroll
+        for(int it=0;it<16;++it) {
+            const int i=tid+it*128,row=i/128,col=4*(i%128),token=qfirst+row;
+            float4 value=make_float4(0,0,0,0);
+            if(token<s.nq) {
+                const float * src=(const float *)(q+size_t(stream)*s.q3+size_t(token)*s.q2+size_t(col/128)*s.q1)+col%128;
+                if (s.q_vec4) value=*(const float4 *)src; else value=make_float4(src[0],src[1],src[2],src[3]);
+            }
+            pre[it]=value;
+        }
+    };
+    fetch(int(blockIdx.y)*QT*16);
+#pragma unroll 1
+    for(int qt=0;qt<QT;++qt) {
+    const int qfirst=(int(blockIdx.y)*QT+qt)*16;
+    if (qfirst>=s.nq) break;
+    if (qt>0) __syncthreads();
+#pragma unroll
+    for(int it=0;it<16;++it) {
+        const int i=tid+it*128,row=i/128,col=4*(i%128);
+        query_tile[row][col/2]=__float22half2_rn(make_float2(pre[it].x,pre[it].y));
+        query_tile[row][col/2+1]=__float22half2_rn(make_float2(pre[it].z,pre[it].w));
+    }
     __syncthreads();
+    if (qt+1<QT) fetch(qfirst+16);
     C acc[4];
 #pragma unroll
     for(int head=0;head<4;++head) {
@@ -670,6 +691,7 @@ __global__ __launch_bounds__(128) void qsa_indexer_wmma16_keyreg(
             out[key]=value;
         }
     }
+    }
 #else
     NO_DEVICE_CODE;
 #endif
@@ -705,18 +727,28 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
     }
     const auto * q=dst->src[0], * k=dst->src[1], * w=dst->src[2], * m=dst->src[3];
     indexer_layout s{q->nb[1],q->nb[2],q->nb[3],k->nb[2],k->nb[3],w ? w->nb[1] : 0,w ? w->nb[3] : 0,
-        m ? m->nb[1] : 0,m ? m->nb[3] : 0,dst->nb[1],dst->nb[3],int(q->ne[2]),int(k->ne[2]),m ? int(m->ne[3]) : 1};
+        m ? m->nb[1] : 0,m ? m->nb[3] : 0,dst->nb[1],dst->nb[3],int(q->ne[2]),int(k->ne[2]),m ? int(m->ne[3]) : 1,
+        uintptr_t(q->data)%16==0 && q->nb[1]%16==0 && q->nb[2]%16==0 && q->nb[3]%16==0};
     const char * wp = w ? (const char *) w->data : nullptr;
     const char * mp = m ? (const char *) m->data : nullptr;
     const int  * lp = dst->src[4] ? (const int *) dst->src[4]->data : nullptr;
     const int    lt = dst->src[4] ? ggml_get_op_params_i32(dst, 1) : 0;
-    const dim3 grid((s.nk+63)/64,(s.nq+15)/16,q->ne[3]), block(32,4);
+    static const int qt = [] { const char * e = getenv("LLAMA_QSA_IDX_QT"); const int v = e ? atoi(e) : 8; return v == 1 || v == 4 || v == 16 ? v : 8; }();
+    const dim3 grid((s.nk+63)/64,(s.nq+16*qt-1)/(16*qt),q->ne[3]), block(32,4);
     ggml_cuda_kernel_launch_params launch(grid,block,0,ctx.stream());
-    if (k->type==GGML_TYPE_F32) {
-        ggml_cuda_kernel_launch(qsa_indexer_wmma16_keyreg<float>,launch,(const char*)q->data,(const char*)k->data,wp,mp,(char*)dst->data,s,lp,lt);
-    } else {
-        ggml_cuda_kernel_launch(qsa_indexer_wmma16_keyreg<half>,launch,(const char*)q->data,(const char*)k->data,wp,mp,(char*)dst->data,s,lp,lt);
-    }
+    auto run=[&](auto kt, auto qtc) {
+        using KT=decltype(kt); constexpr int QTC=decltype(qtc)::value;
+        ggml_cuda_kernel_launch(qsa_indexer_wmma16_keyreg<KT,QTC>,launch,(const char*)q->data,(const char*)k->data,wp,mp,(char*)dst->data,s,lp,lt);
+    };
+    auto by_qt=[&](auto kt) {
+        switch (qt) {
+            case 1:  run(kt, std::integral_constant<int, 1>{});  break;
+            case 4:  run(kt, std::integral_constant<int, 4>{});  break;
+            case 16: run(kt, std::integral_constant<int, 16>{}); break;
+            default: run(kt, std::integral_constant<int, 8>{});  break;
+        }
+    };
+    if (k->type==GGML_TYPE_F32) by_qt(float{}); else by_qt(half{});
     CUDA_CHECK(cudaGetLastError());
 }
 bool ggml_cuda_lightning_indexer_supported(int device, const ggml_tensor * dst) {
