@@ -738,6 +738,18 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         ggml_cuda_flash_attn_ext_qsa(ctx, dst);
         return;
     }
+    {   // GGML_FA_LOG=1: shapes of every large non-qsa flash-attention call (diagnostics)
+        static const bool fa_log = [] { const char * e = getenv("GGML_FA_LOG"); return e && atoi(e) != 0; }();
+        const ggml_tensor * q = dst->src[0], * k = dst->src[1], * m = dst->src[3];
+        if (fa_log && q->ne[1] >= 1024) {
+            GGML_LOG_WARN("fa_log: %s q=[%lld,%lld,%lld,%lld] k=[%lld,%lld,%lld,%lld] k.nb1=%zu mask=%s[%lld,%lld,%lld,%lld] m.nb1=%zu m.data=%p m.buf=%zu src5=%d src6=%d src7=%d\n",
+                dst->name, (long long) q->ne[0], (long long) q->ne[1], (long long) q->ne[2], (long long) q->ne[3],
+                (long long) k->ne[0], (long long) k->ne[1], (long long) k->ne[2], (long long) k->ne[3], k->nb[1],
+                m ? m->name : "-", m ? (long long) m->ne[0] : 0LL, m ? (long long) m->ne[1] : 0LL, m ? (long long) m->ne[2] : 0LL, m ? (long long) m->ne[3] : 0LL,
+                m ? m->nb[1] : (size_t) 0, m ? m->data : nullptr, m && m->buffer ? ggml_backend_buffer_get_size(m->buffer) : (size_t) 0,
+                dst->src[5] != nullptr, dst->src[6] != nullptr, dst->src[7] != nullptr);
+        }
+    }
     // only the qsa kernel honours the selected-cell indices; the kernels below attend to every key, so
     // a maskless sparse op reaching them would read cells the mask exists to hide
     GGML_ASSERT((dst->src[3] || !dst->src[5]) && "sparse flash attention without a mask needs the qsa kernel");
