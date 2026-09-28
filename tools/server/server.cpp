@@ -1,3 +1,4 @@
+#include <chrono>
 #include "server-context.h"
 #include "server-http.h"
 #include "server-models.h"
@@ -81,6 +82,54 @@ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t 
             SRV_ERR("got another exception: %s | while handling exception: %s\n", e.what(), message.c_str());
             res->data = "Internal Server Error";
         }
+        return res;
+    };
+}
+
+// Anthropic routes: every response carries a request id (request-id / x-request-id), and errors use the
+// Anthropic envelope {"type":"error","error":{"type":...,"message":...},"request_id":...}. Unknown server
+// errors (5xx) return a generic message; the detail stays in the log, keyed by the request id.
+static server_http_context::handler_t anthropic_wrapper(server_http_context::handler_t func) {
+    return [inner = ex_wrapper(std::move(func))](const server_http_req & req) -> server_http_res_ptr {
+        static std::atomic<uint64_t> counter{0};
+        char rid[48];
+        snprintf(rid, sizeof(rid), "req_%016llx%08llx", (unsigned long long) std::chrono::system_clock::now().time_since_epoch().count(),
+                 (unsigned long long) counter.fetch_add(1));
+        server_http_res_ptr res = inner(req);
+        res->headers["request-id"]   = rid;
+        res->headers["x-request-id"] = rid;
+        if (res->status < 400 || res->is_stream()) {
+            return res;
+        }
+        std::string message, err_type;
+        try {
+            const json j = json::parse(res->data);
+            const json e = json_value(j, "error", json::object());
+            message = json_value(e, "message", std::string());
+        } catch (...) {
+        }
+        switch (res->status) {
+            case 400: err_type = "invalid_request_error"; break;
+            case 401: err_type = "authentication_error";  break;
+            case 403: err_type = "permission_error";      break;
+            case 404: err_type = "not_found_error";       break;
+            case 413: err_type = "request_too_large";     break;
+            case 429: err_type = "rate_limit_error";      break;
+            case 503: err_type = "overloaded_error";      break;
+            default:  err_type = res->status >= 500 ? "api_error" : "invalid_request_error";
+        }
+        if (res->status >= 500) {
+            SRV_WRN("anthropic %s: server error %d\n", rid, res->status);
+            message = "Internal server error";
+        } else if (message.empty()) {
+            message = "Invalid request";
+        }
+        res->content_type = "application/json; charset=utf-8";
+        res->data = safe_json_to_str({
+            {"type", "error"},
+            {"error", {{"type", err_type}, {"message", message}}},
+            {"request_id", rid},
+        });
         return res;
     };
 }
@@ -260,7 +309,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.post("/responses",                ex_wrapper(routes.post_responses_oai));
     ctx_http.post("/v1/audio/transcriptions",  ex_wrapper(routes.post_transcriptions_oai));
     ctx_http.post("/audio/transcriptions",     ex_wrapper(routes.post_transcriptions_oai));
-    ctx_http.post("/v1/messages",              ex_wrapper(routes.post_anthropic_messages)); // anthropic messages API
+    ctx_http.post("/v1/messages",              anthropic_wrapper(routes.post_anthropic_messages)); // anthropic messages API
     ctx_http.post("/infill",                   ex_wrapper(routes.post_infill));
     ctx_http.post("/embedding",                ex_wrapper(routes.post_embeddings)); // legacy
     ctx_http.post("/embeddings",               ex_wrapper(routes.post_embeddings));
@@ -277,7 +326,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.post("/v1/chat/completions/input_tokens", ex_wrapper(routes.post_chat_completions_tok));
     ctx_http.post("/responses/input_tokens",           ex_wrapper(routes.post_responses_tok_oai));
     ctx_http.post("/v1/responses/input_tokens",        ex_wrapper(routes.post_responses_tok_oai));
-    ctx_http.post("/v1/messages/count_tokens",         ex_wrapper(routes.post_anthropic_count_tokens)); // anthropic token counting
+    ctx_http.post("/v1/messages/count_tokens",         anthropic_wrapper(routes.post_anthropic_count_tokens)); // anthropic token counting
     // LoRA adapters hotswap
     ctx_http.get ("/lora-adapters",            ex_wrapper(routes.get_lora_adapters));
     ctx_http.post("/lora-adapters",            ex_wrapper(routes.post_lora_adapters));

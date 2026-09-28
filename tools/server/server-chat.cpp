@@ -2,6 +2,7 @@
 #include "server-common.h"
 #include "server-anthropic-content.h"
 
+#include <algorithm>
 #include <sstream>
 
 json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
@@ -365,10 +366,32 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
 
     // Convert messages
     if (!body.contains("messages")) {
-        throw std::runtime_error("'messages' is required");
+        throw std::invalid_argument("'messages' is required");
     }
     const json & messages = body.at("messages");
-    if (messages.is_array()) {
+    if (!messages.is_array()) {
+        throw std::invalid_argument("'messages' must be an array");
+    }
+    // tool_use ids of the latest assistant turn, in call order: the tool_result blocks answering them are
+    // emitted in this order (clients may send parallel results in any order; the template matches by position)
+    std::vector<std::string> last_tool_use_ids;
+    {
+        size_t i = 0;
+        for (const auto & msg : messages) {
+            if (!msg.is_object()) {
+                throw std::invalid_argument("messages[" + std::to_string(i) + "] must be an object");
+            }
+            const json role_v = json_value(msg, "role", json());
+            if (!role_v.is_string() || (role_v.get<std::string>() != "user" && role_v.get<std::string>() != "assistant")) {
+                throw std::invalid_argument("messages[" + std::to_string(i) + "].role must be 'user' or 'assistant'");
+            }
+            if (msg.contains("content") && !msg.at("content").is_string() && !msg.at("content").is_array()) {
+                throw std::invalid_argument("messages[" + std::to_string(i) + "].content must be a string or an array of content blocks");
+            }
+            ++i;
+        }
+    }
+    {
         for (const auto & msg : messages) {
             std::string role = json_value(msg, "role", std::string());
 
@@ -463,6 +486,32 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
                 }
             }
 
+            // tool results come right after the assistant turn that called the tools, ordered like the calls,
+            // and before any text of this user message
+            if (tool_results.size() > 1 && !last_tool_use_ids.empty()) {
+                auto rank = [&](const json & m) {
+                    const std::string id = json_value(m, "tool_call_id", std::string());
+                    for (size_t k = 0; k < last_tool_use_ids.size(); ++k) {
+                        if (last_tool_use_ids[k] == id) return k;
+                    }
+                    return last_tool_use_ids.size();
+                };
+                std::vector<json> ordered;
+                for (const auto & t : tool_results) ordered.push_back(t);
+                std::stable_sort(ordered.begin(), ordered.end(), [&](const json & a, const json & b) { return rank(a) < rank(b); });
+                tool_results = json::array();
+                for (auto & t : ordered) tool_results.push_back(t);
+            }
+            for (const auto & tool_msg : tool_results) {
+                oai_messages.push_back(tool_msg);
+            }
+            if (role == "assistant") {
+                last_tool_use_ids.clear();
+                for (const auto & tc : tool_calls) {
+                    last_tool_use_ids.push_back(json_value(tc, "id", std::string()));
+                }
+            }
+
             if (!converted_content.empty() || has_tool_calls || !reasoning_content.empty()) {
                 json new_msg = {{"role", role}};
                 if (!converted_content.empty()) {
@@ -477,10 +526,6 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
                     new_msg["reasoning_content"] = reasoning_content;
                 }
                 oai_messages.push_back(new_msg);
-            }
-
-            for (const auto & tool_msg : tool_results) {
-                oai_messages.push_back(tool_msg);
             }
         }
     }
@@ -515,8 +560,12 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
                 oai_body["tool_choice"] = "auto";
             } else if (type == "any" || type == "tool") {
                 oai_body["tool_choice"] = "required";
+            } else if (type == "none") {
+                // tools stay in the prompt but no tool calls are parsed: tool-call-looking text remains content
+                oai_body["tool_choice"] = "none";
             }
         }
+        // null (or anything else) is treated as absent
     }
 
     // Convert stop_sequences to stop
@@ -545,6 +594,14 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
         if (thinking_type == "enabled") {
             int budget_tokens = json_value(thinking, "budget_tokens", 10000);
             oai_body["thinking_budget_tokens"] = budget_tokens;
+        }
+        if (thinking_type == "enabled" || thinking_type == "disabled") {
+            json kwargs = oai_body.contains("chat_template_kwargs") && oai_body.at("chat_template_kwargs").is_object()
+                ? oai_body.at("chat_template_kwargs") : json::object();
+            if (!kwargs.contains("enable_thinking")) {
+                kwargs["enable_thinking"] = thinking_type == "enabled";
+                oai_body["chat_template_kwargs"] = kwargs;
+            }
         }
     }
 

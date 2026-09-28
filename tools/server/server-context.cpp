@@ -564,10 +564,30 @@ struct server_slot {
         }
     }
 
+    // true while the model is inside a <think> block: opened by the generation prompt (thinking templates end it
+    // with "<think>\n") or by the model itself, and not yet closed in the generated text
+    bool reasoning_open() const {
+        const std::string & gp = task->params.chat_parser_params.generation_prompt;
+        const size_t go = gp.rfind("<think>"), gc = gp.rfind("</think>");
+        const bool open_from_prompt = go != std::string::npos && (gc == std::string::npos || gc < go);
+        const size_t o = generated_text.rfind("<think>"), c = generated_text.rfind("</think>");
+        if (c != std::string::npos && (o == std::string::npos || c > o)) {
+            return false;
+        }
+        return o != std::string::npos || open_from_prompt;
+    }
+
     size_t find_stopping_strings(const std::string & text, const size_t last_token_size, bool is_full_stop) {
         GGML_ASSERT(task);
 
         size_t stop_pos = std::string::npos;
+
+        // client stop strings apply to the answer, not the reasoning: matching them inside <think> ended requests
+        // with an empty answer. EOS and max_tokens are unaffected. LLAMA_ARG_STOP_IN_REASONING=1 restores it.
+        static const bool stop_in_reasoning = [] { const char * e = getenv("LLAMA_ARG_STOP_IN_REASONING"); return e && atoi(e) != 0; }();
+        if (!stop_in_reasoning && !task->params.antiprompt.empty() && reasoning_open()) {
+            return stop_pos;
+        }
 
         for (const std::string & word : task->params.antiprompt) {
             size_t pos;
