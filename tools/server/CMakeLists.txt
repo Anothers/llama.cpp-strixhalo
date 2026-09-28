@@ -31,6 +31,8 @@ add_library(${TARGET} STATIC
     server-mcp.h
     server-schema.cpp
     server-schema.h
+    server-anthropic-content.cpp
+    server-anthropic-content.h
 )
 
 if (BUILD_SHARED_LIBS)
@@ -40,6 +42,25 @@ endif()
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
+
+# Anthropic PDF document blocks: pages rendered with poppler-cpp and encoded with libjpeg (optional;
+# without them PDF documents are rejected with a 400)
+option(LLAMA_SERVER_PDF "llama-server: render PDF document blocks (needs poppler-cpp and libjpeg)" ON)
+if (LLAMA_SERVER_PDF)
+    find_package(PkgConfig QUIET)
+    find_package(JPEG QUIET)
+    if (PkgConfig_FOUND)
+        pkg_check_modules(POPPLER_CPP QUIET IMPORTED_TARGET poppler-cpp)
+    endif()
+    if (POPPLER_CPP_FOUND AND JPEG_FOUND)
+        target_sources(${TARGET} PRIVATE server-pdf.cpp)
+        target_compile_definitions(${TARGET} PRIVATE LLAMA_SERVER_PDF)
+        target_link_libraries(${TARGET} PRIVATE PkgConfig::POPPLER_CPP JPEG::JPEG)
+        message(STATUS "llama-server: PDF document support enabled (poppler-cpp ${POPPLER_CPP_VERSION})")
+    else()
+        message(STATUS "llama-server: PDF document support disabled (poppler-cpp or libjpeg not found)")
+    endif()
+endif()
 
 if (LLAMA_SERVER_PCH)
     target_precompile_headers(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/common/common.h)
