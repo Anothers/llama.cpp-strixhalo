@@ -830,7 +830,8 @@ bool ggml_cuda_mmb_supported_mmid(const ggml_tensor * src0, const ggml_tensor * 
     if (src1->ne[1] != 1 && src1->ne[1] != n_used) return false;
     if (dst->ne[0] != M || dst->ne[1] != n_used || dst->ne[2] != T || dst->ne[3] != 1) return false;
     if (ids->nb[0] != sizeof(int32_t) || ids->ne[2] != 1 || ids->ne[3] != 1) return false;
-    if (T < mmb_min_t() || n_used > 64 || (T * n_used) >> 16 >= 1024) return false;   // tile index must fit in 16 bits per expert
+    static const int min_t_id = [] { const char * e = getenv("GGML_CUDA_MMB_MIN_T_ID"); return e ? atoi(e) : mmb_min_t(); }();
+    if (T < min_t_id || n_used > 64 || (T * n_used) >> 16 >= 1024) return false;   // tile index must fit in 16 bits per expert
     return true;
 }
 
