@@ -3706,12 +3706,22 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        static const bool tdbg = [] { const char * e = getenv("LLAMA_SPEC_TIMING"); return e && atoi(e) != 0; }();
+        static int64_t t_prev_end = 0;
+        const int64_t t_dec0 = ggml_time_us();
         queue_tasks.yield_to_queue([&]() {
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
         });
+        if (tdbg && batch_view.n_tokens >= 512) {
+            const int64_t t_dec1 = ggml_time_us();
+            llama_synchronize(ctx_tgt);
+            const int64_t t_sync = ggml_time_us();
+            SRV_WRN("tgt decode n=%d: since prev process end %.1f ms, decode call %.1f ms, then GPU wait %.1f ms\n", batch_view.n_tokens,
+                    t_prev_end ? (t_dec0 - t_prev_end) / 1e3 : -1.0, (t_dec1 - t_dec0) / 1e3, (t_sync - t_dec1) / 1e3);
+        }
 
         if (ret != 0) {
             {
@@ -3769,12 +3779,30 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (spec) {
+        // LLAMA_MTP_PREFILL_TAIL=N: a prompt ubatch that ends more than N tokens before the end of its prompt skips the
+        // draft head's catch-up decode (the draft attends only to the last N prompt tokens; drafts are always verified)
+        static const int mtp_tail = [] { const char * e = getenv("LLAMA_MTP_PREFILL_TAIL"); return e ? atoi(e) : 0; }();
+        bool skip_draft = false;
+        if (spec && mtp_tail > 0 && batch_view.n_tokens > 16) {
+            const llama_seq_id s0 = batch_view.seq_id[0][0];
+            bool single = true;
+            for (int k = 1; k < batch_view.n_tokens && single; ++k) { single = batch_view.seq_id[k][0] == s0; }
+            if (single) {
+                for (auto & slot : slots) {
+                    if (slot.id == s0 && slot.task) {
+                        const int64_t total = slot.task->n_tokens();
+                        skip_draft = (int64_t) batch_view.pos[batch_view.n_tokens - 1] + mtp_tail < total;
+                    }
+                }
+            }
+        }
+        if (spec && !skip_draft) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch_view);
             });
 
+            if (tdbg) { t_prev_end = ggml_time_us(); }
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
 

@@ -10,6 +10,7 @@
 #include "ngram-mod.h"
 #include "sampling.h"
 
+#include <thread>
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
@@ -1327,6 +1328,23 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 };
 
+// memcpy of the prefill-sized hidden-state blocks (8192 x n_embd floats = 84 MB) split over a few threads: a single
+// thread spent ~18 ms per copy while the GPU sat idle between the target ubatch and the draft decode
+static void spec_par_memcpy(void * dst, const void * src, size_t n) {
+    constexpr size_t min_split = 8u << 20;
+    if (n < min_split) { std::memcpy(dst, src, n); return; }
+    const int nt = 8;
+    const size_t chunk = (n / nt + 63) & ~(size_t) 63;
+    std::vector<std::thread> th;
+    for (int t = 1; t < nt; ++t) {
+        const size_t off = (size_t) t * chunk;
+        if (off >= n) break;
+        th.emplace_back([=] { std::memcpy((char *) dst + off, (const char *) src + off, std::min(chunk, n - off)); });
+    }
+    std::memcpy(dst, src, std::min(chunk, n));
+    for (auto & x : th) x.join();
+}
+
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
@@ -1357,8 +1375,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     // Hidden rows from the most recent target verification batch, grouped by seq.
     // Row 0 corresponds to the sampled token, row N to the Nth accepted draft token.
-    std::vector<std::vector<float>> verify_h;
+    std::vector<std::vector<float>> verify_h;      // the first VERIFY_KEEP rows
+    std::vector<std::vector<float>> verify_last;   // the last row
     std::vector<int32_t> verify_h_rows;
+    static constexpr int32_t VERIFY_KEEP = 64;
 
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
@@ -1442,6 +1462,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         i_batch_end.assign(n_seq, -1);
 
         verify_h.assign(n_seq, {});
+        verify_last.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
     }
 
@@ -1516,6 +1537,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        static const bool tdbg = [] { const char * e = getenv("LLAMA_SPEC_TIMING"); return e && atoi(e) != 0; }();
+        int64_t t_0 = ggml_time_us(), t_h = 0, t_cp = 0, t_dec = 0;
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
@@ -1532,7 +1555,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // TODO:this is generally true, but would be nice to assert it
             {
                 const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
-                std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
+                t_h = ggml_time_us();
+                spec_par_memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
+                t_cp = ggml_time_us();
             }
 
             // fill the pending embeddings from a previous run
@@ -1575,6 +1600,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (chain_heads) {
                 llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
             }
+            t_dec = ggml_time_us();
             if (!ok) {
                 return false;
             }
@@ -1587,15 +1613,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
             verify_h_rows[seq_id] = n_rows;
-            verify_h[seq_id].resize((size_t) n_rows * n_embd);
+            // accept() reads row min(n_accepted, n_rows - 1): only the first few rows of a verification batch or the
+            // last row. A prefill batch keeps its first VERIFY_KEEP rows and the last one (the full copy was 84 MB).
+            const int32_t n_keep = n_rows <= VERIFY_KEEP ? n_rows : VERIFY_KEEP;
+            verify_h[seq_id].resize((size_t) n_keep * n_embd);
 
-            for (int32_t i = 0; i < n_rows; ++i) {
+            for (int32_t i = 0; i < n_keep; ++i) {
                 const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
+            verify_last[seq_id].resize(n_embd);
+            std::memcpy(verify_last[seq_id].data(), llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_end[seq_id]), row_bytes);
 
-            std::memcpy(pending_h[seq_id].data(),
-                    verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+            std::memcpy(pending_h[seq_id].data(), verify_last[seq_id].data(), row_bytes);
+        }
+        if (tdbg && n_tokens >= 512) {
+            const int64_t t_v = ggml_time_us();
+            SPC_WRN("mtp process n=%d: wait_h %.1f ms, copy %.1f ms, dft_decode %.1f ms, verify_copy %.1f ms\n", n_tokens,
+                    (t_h - t_0) / 1e3, (t_cp - t_h) / 1e3, (t_dec - t_cp) / 1e3, (t_v - t_dec) / 1e3);
         }
 
         return true;
@@ -1764,7 +1799,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
-        std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+        const float * src = i_h == n_rows - 1 ? verify_last[seq_id].data() : verify_h[seq_id].data() + (size_t) i_h * n_embd;
+        GGML_ASSERT(i_h == n_rows - 1 || i_h < VERIFY_KEEP);
+        std::memcpy(pending_h[seq_id].data(), src, row_bytes);
     }
 };
 
