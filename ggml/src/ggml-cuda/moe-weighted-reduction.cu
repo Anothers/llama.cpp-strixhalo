@@ -138,6 +138,55 @@ static __global__ void moe_weighted_reduction_f32in_bf16out_v4(const float * __r
     *(ushort4 *)(dst + token * n_embd + col4) = make_ushort4(moe_f2bf(sum.x), moe_f2bf(sum.y), moe_f2bf(sum.z), moe_f2bf(sum.w));
 }
 
+
+// + shared expert: out = sum_e w_e * expert_e + shexp * sigmoid(gate[token]) (Qwen3-Next ffn_out), so the routed sum
+// is never written on its own and read back by the gated residual
+static __global__ void moe_weighted_reduction_bf16_v4_sig(const uint16_t * __restrict__ experts,
+                                                          const float * __restrict__ expert_scale,
+                                                          const float * __restrict__ weights,
+                                                          float * __restrict__ dst,
+                                                          const float * __restrict__ shexp,
+                                                          const float * __restrict__ gate,
+                                                          const int64_t n_embd, const int n_expert_used) {
+    const int64_t token = blockIdx.x;
+    const int64_t col4  = ((int64_t) blockIdx.y * blockDim.x + threadIdx.x) * 4;
+    if (col4 >= n_embd) return;
+    const uint64_t first_row = (uint64_t) token * n_expert_used;
+    const float first_scale = expert_scale != nullptr ? expert_scale[first_row] : 1.0f;
+    const float w0 = weights[first_row];
+    const ushort4 h0 = *(const ushort4 *)(experts + first_row * n_embd + col4);
+    float4 sum; sum.x = (moe_bf2f(h0.x) * first_scale) * w0; sum.y = (moe_bf2f(h0.y) * first_scale) * w0;
+    sum.z = (moe_bf2f(h0.z) * first_scale) * w0; sum.w = (moe_bf2f(h0.w) * first_scale) * w0;
+    for (int expert = 1; expert < n_expert_used; ++expert) {
+        const uint64_t row = first_row + expert;
+        const float scale = expert_scale != nullptr ? expert_scale[row] : 1.0f;
+        const float w = weights[row];
+        const ushort4 h = *(const ushort4 *)(experts + row * n_embd + col4);
+        sum.x += (moe_bf2f(h.x) * scale) * w; sum.y += (moe_bf2f(h.y) * scale) * w;
+        sum.z += (moe_bf2f(h.z) * scale) * w; sum.w += (moe_bf2f(h.w) * scale) * w;
+    }
+    const float sg = 1.0f/(1.0f + expf(-gate[token]));
+    const float4 b = *(const float4 *)(shexp + token * n_embd + col4);
+    *(float4 *)(dst + token * n_embd + col4) = make_float4(sum.x + b.x*sg, sum.y + b.y*sg, sum.z + b.z*sg, sum.w + b.w*sg);
+}
+
+bool ggml_cuda_op_moe_weighted_reduction_sig(ggml_backend_cuda_context & ctx, const ggml_tensor * experts,
+        const ggml_tensor * expert_scale, const ggml_tensor * weights, ggml_tensor * dst, const ggml_tensor * shexp, const ggml_tensor * gate) {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_MOE_SIGMERGE"); return !e || atoi(e) != 0; }();
+    if (!on || !(ggml_cuda_mmb_down16() && ggml_cuda_mmb_is_bf16_only(experts)) || ggml_cuda_mmb_is_bf16_only(dst)) return false;
+    const int64_t n_embd = experts->ne[0], n_expert_used = experts->ne[1], n_tokens = experts->ne[2] * experts->ne[3];
+    if (n_embd % 4 || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || shexp->type != GGML_TYPE_F32 || !ggml_is_contiguous(shexp) ||
+        gate->type != GGML_TYPE_F32 || !ggml_is_contiguous(gate) || ggml_nelements(gate) != n_tokens || ggml_nelements(shexp) != n_embd * n_tokens ||
+        ((uintptr_t) experts->data % 16) || ((uintptr_t) dst->data % 16) || ((uintptr_t) shexp->data % 16)) return false;
+    constexpr int threads = 256;
+    const dim3 blocks(n_tokens, (n_embd / 4 + threads - 1) / threads, 1);
+    moe_weighted_reduction_bf16_v4_sig<<<blocks, threads, 0, ctx.stream()>>>((const uint16_t *) experts->data,
+        expert_scale ? (const float *) expert_scale->data : nullptr, (const float *) weights->data, (float *) dst->data,
+        (const float *) shexp->data, (const float *) gate->data, n_embd, (int) n_expert_used);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 static void launch_moe_weighted_reduction(const float * experts,
                                           const float * expert_scale,
                                           const float * weights,

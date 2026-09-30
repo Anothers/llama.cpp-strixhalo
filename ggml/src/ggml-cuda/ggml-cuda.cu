@@ -46,6 +46,8 @@
 void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx, const ggml_tensor * experts,
                                          const ggml_tensor * expert_scale, const ggml_tensor * weights,
                                          ggml_tensor * dst, const ggml_tensor * merge);
+bool ggml_cuda_op_moe_weighted_reduction_sig(ggml_backend_cuda_context & ctx, const ggml_tensor * experts,
+        const ggml_tensor * expert_scale, const ggml_tensor * weights, ggml_tensor * dst, const ggml_tensor * shexp, const ggml_tensor * gate);
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -3993,6 +3995,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
             int count = match.node_count;
+            {   // Qwen3-Next: reduction -> sigmoid(gate) -> mul(shexp) -> add(reduction): one kernel
+                ggml_cuda_sigmul_add_args sa;
+                const int nsig = i + match.node_count;
+                if (ggml_node_has_n_uses(cgraph, nsig - 1, 1) && ggml_cuda_match_sigmul_add(cgraph, nsig, sa) == 3 && sa.a == match.dst &&
+                        sa.g->ne[0] == 1) {
+                    const int out_idx = nsig + 2;
+                    if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, count + 3, &out_idx, 1) &&
+                            ggml_cuda_op_moe_weighted_reduction_sig(*cuda_ctx, match.experts, match.expert_scale, match.weights, sa.dst, sa.b, sa.g)) {
+                        return count + 3 - 1;
+                    }
+                }
+            }
             const ggml_tensor * merge = nullptr;
             {   // shared-expert merge: ADD(reduction, ffn_shexp_gated) right after, with the reduction used only there
                 const int nadd = i + match.node_count;
