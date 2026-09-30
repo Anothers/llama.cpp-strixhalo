@@ -4,6 +4,12 @@
 #include "llama-impl.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdlib>
+#include <exception>
+#include <mutex>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -38,6 +44,14 @@ struct llama_lazy_reader {
     llama_lazy_reader & operator=(const llama_lazy_reader &) = delete;
 
     ~llama_lazy_reader() {
+        {
+            std::lock_guard<std::mutex> lk(pm);
+            stop = true;
+        }
+        cv_work.notify_all();
+        for (auto & t : pool) {
+            t.join();
+        }
         if (fd >= 0) {
             ::close(fd);
         }
@@ -55,6 +69,9 @@ struct llama_lazy_reader {
     // dst[slot * head_dim, ...) = to_float(table[rows[slot]])
     // thread-safe; never lets an exception escape a worker thread
     void gather(const int32_t * rows, int64_t n, float * dst) const {
+        std::lock_guard<std::mutex> one(gather_mtx); // the pool runs one gather at a time
+        const auto t0 = std::chrono::steady_clock::now();
+
         std::vector<std::pair<int32_t, int32_t>> pairs;
         pairs.reserve(n);
         for (int64_t i = 0; i < n; ++i) {
@@ -64,40 +81,66 @@ struct llama_lazy_reader {
 
         std::sort(pairs.begin(), pairs.end()); // equal rows adjacent, file order
 
-        // small gathers are not worth a thread per row
-        const int n_workers = (int) std::min<int64_t>(n_threads, std::max<int64_t>(1, n / 32));
+        // one work item per distinct row: runs[r] .. runs[r + 1] share a row
+        std::vector<int64_t> runs;
+        runs.reserve(n + 1);
+        for (int64_t i = 0; i < n; ++i) {
+            if (i == 0 || pairs[i].first != pairs[i - 1].first) {
+                runs.push_back(i);
+            }
+        }
+        runs.push_back(n);
+        const int64_t n_runs = (int64_t) runs.size() - 1;
 
-        auto run_chunk = [&](int w, std::exception_ptr & err) {
-            try {
-                run_range(pairs, n * w / n_workers, n * (w + 1) / n_workers, dst);
-            } catch (...) {
-                err = std::current_exception();
+        // Each missed row is a random ~100 B read from a multi-GiB table, i.e. one NVMe round trip (~0.1 ms),
+        // so even a decode-sized gather (a few tokens x all heads) must keep many reads in flight: a persistent
+        // pool takes one row at a time. Only a gather of one or two rows stays on the calling thread.
+        static const bool force_serial = getenv("LLAMA_LAZY_SERIAL") != nullptr; // A/B: the old one-reader behaviour
+        if (n_threads <= 1 || n_runs <= 2 || force_serial) {
+            std::vector<uint8_t> bounce(row_size);
+            for (int64_t r = 0; r < n_runs; ++r) {
+                read_run(pairs, runs[r], runs[r + 1], dst, bounce);
             }
-        };
-
-        std::vector<std::exception_ptr> errs(n_workers);
-        std::vector<std::thread> workers;
-        try {
-            for (int w = 1; w < n_workers; ++w) {
-                workers.emplace_back([&run_chunk, &errs, w]() {
-                    run_chunk(w, errs[w]);
-                });
+        } else {
+            if (pool.empty()) {
+                pool.reserve(n_threads - 1);
+                for (int w = 1; w < n_threads; ++w) {
+                    pool.emplace_back([this]() { worker(); });
+                }
             }
-        } catch (...) {
-            for (auto & t : workers) {
-                t.join();
+            job_pairs = &pairs;
+            job_runs  = &runs;
+            job_dst   = dst;
+            job_err   = nullptr;
+            next.store(0);
+            {
+                std::lock_guard<std::mutex> lk(pm);
+                pending = (int) pool.size();
+                ++gen;
             }
-            throw;
+            cv_work.notify_all();
+            std::vector<uint8_t> bounce(row_size);
+            drain(bounce);
+            {
+                std::unique_lock<std::mutex> lk(pm);
+                cv_done.wait(lk, [&] { return pending == 0; });
+            }
+            job_pairs = nullptr;
+            job_runs  = nullptr;
+            job_dst   = nullptr;
+            if (job_err) {
+                std::rethrow_exception(job_err);
+            }
         }
 
-        run_chunk(0, errs[0]);
-        for (auto & t : workers) {
-            t.join();
-        }
-
-        for (const auto & err : errs) {
-            if (err) {
-                std::rethrow_exception(err);
+        if (stats_on()) {
+            st_calls += 1;
+            st_rows  += n;
+            st_uniq  += n_runs;
+            st_us    += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+            if (st_calls % 200 == 0) {
+                fprintf(stderr, "LAZYSTATS gathers=%lld rows=%lld uniq=%lld total=%.1f ms (%.3f ms/gather)\n",
+                        (long long) st_calls, (long long) st_rows, (long long) st_uniq, st_us / 1000.0, st_us / 1000.0 / st_calls);
             }
         }
     }
@@ -132,37 +175,94 @@ struct llama_lazy_reader {
     }
 
 private:
-    void run_range(const std::vector<std::pair<int32_t, int32_t>> & pairs,
-                   int64_t begin, int64_t end, float * dst) const {
-        std::vector<uint8_t> bounce(row_size);
-        for (int64_t i = begin; i < end; ) {
-            int64_t j = i;
-            while (j + 1 < end && pairs[j + 1].first == pairs[i].first) {
-                ++j;
+    // read the row shared by pairs[begin, end), dequantize it once, copy it to every slot that asked for it
+    void read_run(const std::vector<std::pair<int32_t, int32_t>> & pairs, int64_t begin, int64_t end, float * dst,
+                  std::vector<uint8_t> & bounce) const {
+        const size_t off = base + (size_t) pairs[begin].first * row_size;
+        for (size_t done = 0; done < row_size; ) {
+            const ssize_t n_read = ::pread(fd, bounce.data() + done, row_size - done, off + done);
+            if (n_read < 0 && errno == EINTR) {
+                continue;
             }
-            const size_t off = base + (size_t) pairs[i].first * row_size;
-            for (size_t done = 0; done < row_size; ) {
-                const ssize_t n_read = ::pread(fd, bounce.data() + done, row_size - done, off + done);
-                if (n_read < 0 && errno == EINTR) {
-                    continue;
-                }
-                if (n_read <= 0) {
-                    throw std::runtime_error(format("lazy direct read of %zu bytes at file offset %zu failed: %s",
-                            row_size, off, n_read == 0 ? "unexpected EOF" : strerror(errno)));
-                }
-                done += n_read;
+            if (n_read <= 0) {
+                throw std::runtime_error(format("lazy direct read of %zu bytes at file offset %zu failed: %s",
+                        row_size, off, n_read == 0 ? "unexpected EOF" : strerror(errno)));
             }
-            float * first = dst + (size_t) pairs[i].second * head_dim;
-            if (to_float) {
-                to_float(bounce.data(), first, head_dim);
-            } else {
-                memcpy(first, bounce.data(), (size_t) head_dim * sizeof(float));
-            }
-            for (int64_t k = i + 1; k <= j; ++k) {
-                memcpy(dst + (size_t) pairs[k].second * head_dim, first, (size_t) head_dim * sizeof(float));
-            }
-            i = j + 1;
+            done += n_read;
+        }
+        float * first = dst + (size_t) pairs[begin].second * head_dim;
+        if (to_float) {
+            to_float(bounce.data(), first, head_dim);
+        } else {
+            memcpy(first, bounce.data(), (size_t) head_dim * sizeof(float));
+        }
+        for (int64_t k = begin + 1; k < end; ++k) {
+            memcpy(dst + (size_t) pairs[k].second * head_dim, first, (size_t) head_dim * sizeof(float));
         }
     }
+
+    // take rows until the job is exhausted; errors are kept, never thrown out of a worker
+    void drain(std::vector<uint8_t> & bounce) const {
+        const auto & runs = *job_runs;
+        for (;;) {
+            const int64_t r = next.fetch_add(1);
+            if (r + 1 >= (int64_t) runs.size()) {
+                break;
+            }
+            try {
+                read_run(*job_pairs, runs[r], runs[r + 1], job_dst, bounce);
+            } catch (...) {
+                std::lock_guard<std::mutex> lk(err_mtx);
+                if (!job_err) {
+                    job_err = std::current_exception();
+                }
+            }
+        }
+    }
+
+    void worker() const {
+        std::vector<uint8_t> bounce(row_size);
+        uint64_t seen = 0;
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lk(pm);
+                cv_work.wait(lk, [&] { return stop || gen != seen; });
+                if (stop) {
+                    return;
+                }
+                seen = gen;
+            }
+            drain(bounce);
+            {
+                std::lock_guard<std::mutex> lk(pm);
+                if (--pending == 0) {
+                    cv_done.notify_one();
+                }
+            }
+        }
+    }
+
+    static bool stats_on() {
+        static const bool on = getenv("LLAMA_LAZY_STATS") != nullptr;
+        return on;
+    }
+
+    // persistent read pool (started on the first multi-row gather)
+    mutable std::mutex                       gather_mtx;
+    mutable std::mutex                       pm;
+    mutable std::condition_variable          cv_work;
+    mutable std::condition_variable          cv_done;
+    mutable std::vector<std::thread>         pool;
+    mutable bool                             stop    = false;
+    mutable uint64_t                         gen     = 0;
+    mutable int                              pending = 0;
+    mutable std::atomic<int64_t>             next{0};
+    mutable const std::vector<std::pair<int32_t, int32_t>> * job_pairs = nullptr;
+    mutable const std::vector<int64_t> *     job_runs  = nullptr;
+    mutable float *                          job_dst   = nullptr;
+    mutable std::exception_ptr               job_err;
+    mutable std::mutex                       err_mtx;
+
+    mutable int64_t st_calls = 0, st_rows = 0, st_uniq = 0, st_us = 0;
 #endif
 };
