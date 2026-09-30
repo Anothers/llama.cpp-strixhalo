@@ -4764,6 +4764,40 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
+// Qwen3-Next GDN block as the model builds it: q/k/v views of one conv output, q/k l2-normalized as
+// scale(rms_norm(x, eps/n), 1/sqrt(n)), 16 key heads repeated over 48 value heads (the HIP tiled kernel's shape)
+struct test_gdn_qknorm : public test_case {
+    const int64_t T; const int64_t K;
+    std::string vars() override { return VARS_TO_STR2(T, K); }
+    test_gdn_qknorm(int64_t T = 64, int64_t K = 1) : T(T), K(K) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t D = 128, HK = 16, HV = 48, C = 2*D*HK + D*HV;
+        ggml_tensor * qkv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, T); ggml_set_name(qkv, "qkv");
+        const size_t es = ggml_element_size(qkv);
+        ggml_tensor * q = ggml_view_4d(ctx, qkv, D, HK, T, 1, es*D, qkv->nb[1], qkv->nb[1]*T, 0);
+        ggml_tensor * k = ggml_view_4d(ctx, qkv, D, HK, T, 1, es*D, qkv->nb[1], qkv->nb[1]*T, es*D*HK);
+        ggml_tensor * v = ggml_view_4d(ctx, qkv, D, HV, T, 1, es*D, qkv->nb[1], qkv->nb[1]*T, es*2*D*HK);
+        q = ggml_scale(ctx, ggml_rms_norm(ctx, q, 1e-6f/D), 1.0f/sqrtf((float) D));
+        k = ggml_scale(ctx, ggml_rms_norm(ctx, k, 1e-6f/D), 1.0f/sqrtf((float) D));
+        ggml_tensor * g     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, HV, T, 1); ggml_set_name(g, "g");
+        ggml_tensor * beta  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, HV, T, 1); ggml_set_name(beta, "beta");
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, D, HV, 1); ggml_set_name(state, "state");
+        ggml_tensor * out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
+        ggml_set_name(out, "out");
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "g") == 0)         { init_tensor_uniform(t, -20.0f, -1e-4f); }
+            else if (strcmp(t->name, "beta") == 0) { init_tensor_uniform(t, 0.0f, 1.0f); }
+            else                                   { init_tensor_uniform(t); }
+        }
+    }
+    bool run_whole_graph() override { return true; }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "GDN_QKNORM"; }
+};
+
 // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
@@ -5308,6 +5342,39 @@ struct test_mul_mat_id : public test_case {
 
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
 // MoE gate/up as two MUL_MAT_ID sharing ids and a broadcast activation, then SWIGLU: the shape the backends fuse
+// Qwen3-Next attention q/k: rms_norm(view of the fused projection) * w, then partial (i)mrope
+struct test_norm_rope : public test_case {
+    const int64_t D, H, nt; const int n_dims; const bool imrope;
+    std::string vars() override { return VARS_TO_STR5(D, H, nt, n_dims, imrope); }
+    test_norm_rope(int64_t D = 256, int64_t H = 16, int64_t nt = 64, int n_dims = 64, bool imrope = true) : D(D), H(H), nt(nt), n_dims(n_dims), imrope(imrope) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * qf = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*D*H, nt); ggml_set_name(qf, "qfull");
+        ggml_tensor * q = ggml_view_3d(ctx, qf, D, H, nt, ggml_element_size(qf)*D*2, qf->nb[1], 0);
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, D); ggml_set_name(w, "w");
+        ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4*nt); ggml_set_name(pos, "pos");
+        ggml_tensor * n = ggml_mul(ctx, ggml_rms_norm(ctx, q, 1e-6f), w);
+        int sections[4] = {11, 11, 10, 0};
+        ggml_tensor * out = ggml_rope_multi(ctx, n, pos, nullptr, n_dims, sections, imrope ? GGML_ROPE_TYPE_IMROPE : GGML_ROPE_TYPE_MROPE,
+                                            262144, 10000000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        ggml_set_name(out, "out");
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int> v(ggml_nelements(t));
+                for (size_t i = 0; i < v.size(); ++i) v[i] = (int) ((i % nt) * 3 + 70000);
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 1e-6; }   // large positions: cos/sin of big angles differ in the last bits
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "NORM_ROPE"; }
+};
+
 // GDN q/k l2 norm as built by build_gdn_l2_norm: scale(rms_norm(view, eps/n), 1/sqrt(n)) on strided head rows
 struct test_rms_scale : public test_case {
     const int64_t D, H, nt;
@@ -10560,6 +10627,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // For issue 27873
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 1, 1, false, 1, 8192, 4096));
+    for (int64_t T : {8, 16, 64, 513}) {
+        test_cases.emplace_back(new test_gdn_qknorm(T, 1));
+    }
+    test_cases.emplace_back(new test_gdn_qknorm(64, 3));
+    for (bool im : {true, false}) {
+        for (int64_t nt : {1, 7, 513}) {
+            test_cases.emplace_back(new test_norm_rope(256, 16, nt, 64, im));
+        }
+    }
+    test_cases.emplace_back(new test_norm_rope(128, 8, 33, 128, true));
     for (int64_t D : {64, 128, 256}) {
         for (int64_t nt : {1, 7, 513}) {
             test_cases.emplace_back(new test_rms_scale(D, 16, nt));

@@ -1,3 +1,4 @@
+#include <unordered_map>
 #include "gated_delta_net.cuh"
 #include "common.cuh"
 
@@ -195,7 +196,7 @@ gated_delta_net_cuda(const float * q,
     }
 }
 
-template <int S_v, int NUM_WARPS, int COLS, int TOKEN_TILE, bool keep_rs_t>
+template <int S_v, int NUM_WARPS, int COLS, int TOKEN_TILE, bool keep_rs_t, bool NQK = false>
 __global__ void __launch_bounds__(32 * NUM_WARPS, 1)
 gated_delta_net_tiled_cuda(const float * q,
                            const float * k,
@@ -220,10 +221,16 @@ gated_delta_net_tiled_cuda(const float * q,
                            const uint3   rq3_magic,
                            float         scale,
                            int64_t       state_slot_stride,
-                           int           K) {
+                           int           K,
+                           const float   q_eps = 0.0f, const float q_scale = 1.0f,
+                           const float   k_eps = 0.0f, const float k_scale = 1.0f) {
     constexpr int warp_size     = 32;
     constexpr int rows_per_lane = S_v / warp_size;
     constexpr int block_cols    = NUM_WARPS * COLS;
+    // NQK: q and k arrive raw (the conv output views); the per-token l2 norm the graph built as RMS_NORM -> SCALE
+    // (x * rsqrt(mean(x^2) + eps) * scale) is applied here on the staged tile
+    __shared__ float qn_shared[NQK ? TOKEN_TILE : 1];
+    __shared__ float kn_shared[NQK ? TOKEN_TILE : 1];
     static_assert(S_v % warp_size == 0, "S_v must be a multiple of the warp size");
     static_assert(S_v % block_cols == 0, "block columns must divide S_v");
 
@@ -282,6 +289,24 @@ gated_delta_net_tiled_cuda(const float * q,
             beta_shared[thread] = beta[gb_offset];
         }
         __syncthreads();
+        if constexpr (NQK) {
+            const int warp = threadIdx.y;
+            for (int tt = warp; tt < tile_size; tt += NUM_WARPS) {
+                float sq = 0.0f, sk = 0.0f;
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    const float a = q_shared[tt][r * warp_size + lane], b = k_shared[tt][r * warp_size + lane];
+                    sq += a * a; sk += b * b;
+                }
+                sq = gdn_warp_reduce_sum<warp_size>(sq);
+                sk = gdn_warp_reduce_sum<warp_size>(sk);
+                if (lane == 0) {
+                    qn_shared[tt] = rsqrtf(sq / S_v + q_eps) * q_scale;
+                    kn_shared[tt] = rsqrtf(sk / S_v + k_eps) * k_scale;
+                }
+            }
+            __syncthreads();
+        }
 
         for (int tt = 0; tt < tile_size; ++tt) {
             const int t = t0 + tt;
@@ -293,6 +318,11 @@ gated_delta_net_tiled_cuda(const float * q,
                 const int i = r * warp_size + lane;
                 k_reg[r] = k_shared[tt][i];
                 q_reg[r] = q_shared[tt][i];
+            }
+            if constexpr (NQK) {
+                const float qs = qn_shared[tt], ks = kn_shared[tt];
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) { q_reg[r] *= qs; k_reg[r] *= ks; }
             }
 
             const float g_val    = expf(g_shared[tt]);
@@ -370,7 +400,7 @@ static void launch_gated_delta_net(
         int64_t sv1,   int64_t sv2, int64_t sv3,
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
-        float scale, int64_t state_slot_stride, int K, cudaStream_t stream) {
+        float scale, int64_t state_slot_stride, int K, cudaStream_t stream, const ggml_cuda_gdn_qknorm * qkn = nullptr) {
     //TODO: Add chunked kernel for even faster pre-fill
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int num_warps = 4;
@@ -386,10 +416,17 @@ static void launch_gated_delta_net(
             const dim3 tiled_grid(H, n_seqs, 2);
             const dim3 tiled_block(warp_size, 8, 1);
             const ggml_cuda_kernel_launch_params tiled_params(tiled_grid, tiled_block, 0, stream);
+            if (qkn) {
+                ggml_cuda_kernel_launch(gated_delta_net_tiled_cuda<128, 8, 8, 16, keep_rs_t, true>, tiled_params,
+                    qkn->q, qkn->k, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens,
+                    sq1, qkn->sq2, qkn->sq3, sv1, sv2, sv3, sb1, sb2, sb3,
+                    neqk1_magic, rq3_magic, scale, state_slot_stride, K, qkn->q_eps, qkn->q_scale, qkn->k_eps, qkn->k_scale);
+                return;
+            }
             ggml_cuda_kernel_launch(gated_delta_net_tiled_cuda<128, 8, 8, 16, keep_rs_t>, tiled_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens,
                 sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
-                neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+                neqk1_magic, rq3_magic, scale, state_slot_stride, K, 0.0f, 1.0f, 0.0f, 1.0f);
             return;
         }
     }
@@ -502,6 +539,22 @@ static void ggml_cuda_op_gated_delta_net_impl(
         state_slot_stride = cache->slot_stride;
     }
 
+    ggml_cuda_gdn_qknorm qkn;
+    const bool has_qkn = !kda && ggml_cuda_gdn_qknorm_take(dst, qkn);
+    if (has_qkn) {
+        GGML_ASSERT(ggml_cuda_gdn_qknorm_eligible(dst));
+        if (keep_rs) {
+            launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream, &qkn);
+        } else {
+            launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream, &qkn);
+        }
+        return;
+    }
+
     if (kda) {
         if (keep_rs) {
             launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
@@ -532,4 +585,26 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
 void ggml_cuda_op_gated_delta_net_fused_cache(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_cuda_gated_delta_net_fused_cache cache) {
     ggml_cuda_op_gated_delta_net_impl(ctx, dst, &cache);
+}
+
+// q/k l2 norm fused into the tiled kernel: try_fuse skips the RMS_NORM -> SCALE pairs and parks the raw views here
+static thread_local std::unordered_map<const ggml_tensor *, ggml_cuda_gdn_qknorm> g_gdn_qknorm;
+
+bool ggml_cuda_gdn_qknorm_eligible(const ggml_tensor * gdn) {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_GDN_QKNORM"); return !e || atoi(e) != 0; }();
+    if (!on || gdn->op != GGML_OP_GATED_DELTA_NET) return false;
+    const ggml_tensor * v = gdn->src[2], * g = gdn->src[3];
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const int K = ggml_get_op_params_i32(gdn, 0);
+    return GGML_CUDA_CC_IS_RDNA3_5(cc) && v->ne[0] == 128 && v->ne[1] == 48 && v->ne[3] == 1 && v->ne[2] >= 16 && v->ne[2] <= 32768 &&
+           g->ne[0] == 1 && K >= 1;
+}
+
+void ggml_cuda_gdn_qknorm_put(const ggml_tensor * gdn, const ggml_cuda_gdn_qknorm & e) { g_gdn_qknorm[gdn] = e; }
+
+bool ggml_cuda_gdn_qknorm_take(const ggml_tensor * gdn, ggml_cuda_gdn_qknorm & e) {
+    auto it = g_gdn_qknorm.find(gdn);
+    if (it == g_gdn_qknorm.end()) return false;
+    e = it->second; g_gdn_qknorm.erase(it);
+    return true;
 }

@@ -3806,6 +3806,48 @@ static int ggml_cuda_match_idx_relu_sum(const ggml_cgraph * g, int i, ggml_cuda_
     return count;
 }
 
+// GDN q/k l2 norm (RMS_NORM -> SCALE on the conv output views) applied inside the tiled GDN kernel: at the first of the
+// norms, find the GATED_DELTA_NET that consumes both, park the raw views and skip the pair; the second pair is skipped
+// on the same test. The raw views are slices of the conv output, which stays live until the GDN (it also reads v).
+static int ggml_cuda_count_uses(const ggml_cgraph * g, const ggml_tensor * t) {
+    int n = 0;
+    for (int j = 0; j < g->n_nodes; ++j) for (int s = 0; s < GGML_MAX_SRC; ++s) n += g->nodes[j]->src[s] == t;
+    return n;
+}
+static bool ggml_cuda_gdn_qknorm_pair(const ggml_tensor * sc, const ggml_tensor ** raw, float & eps, float & scale) {
+    if (!sc || sc->op != GGML_OP_SCALE || sc->type != GGML_TYPE_F32) return false;
+    const ggml_tensor * rms = sc->src[0];
+    if (!rms || rms->op != GGML_OP_RMS_NORM || rms->type != GGML_TYPE_F32) return false;
+    float b; memcpy(&scale, (const float *) sc->op_params + 0, sizeof(float)); memcpy(&b, (const float *) sc->op_params + 1, sizeof(float));
+    if (b != 0.0f) return false;
+    memcpy(&eps, rms->op_params, sizeof(float));
+    *raw = rms->src[0];
+    return (*raw)->type == GGML_TYPE_F32 && (*raw)->nb[0] == sizeof(float) && (*raw)->ne[0] == sc->ne[0] && ggml_are_same_shape(*raw, sc);
+}
+static int ggml_cuda_try_gdn_qknorm(const ggml_cgraph * g, int i) {
+    if (i + 1 >= g->n_nodes) return 0;
+    const ggml_tensor * rms = g->nodes[i], * sc = g->nodes[i+1];
+    if (rms->op != GGML_OP_RMS_NORM || sc->op != GGML_OP_SCALE || sc->src[0] != rms) return 0;
+    const ggml_tensor * gdn = nullptr;
+    for (int j = i + 2; j < g->n_nodes && j < i + 400; ++j) {
+        const ggml_tensor * nd = g->nodes[j];
+        if (nd->op == GGML_OP_GATED_DELTA_NET && (nd->src[0] == sc || nd->src[1] == sc)) { gdn = nd; break; }
+    }
+    if (!gdn || !ggml_cuda_gdn_qknorm_eligible(gdn)) return 0;
+    ggml_cuda_gdn_qknorm e;
+    const ggml_tensor * qraw = nullptr, * kraw = nullptr;
+    if (!ggml_cuda_gdn_qknorm_pair(gdn->src[0], &qraw, e.q_eps, e.q_scale) || !ggml_cuda_gdn_qknorm_pair(gdn->src[1], &kraw, e.k_eps, e.k_scale)) return 0;
+    for (int d = 1; d < 4; ++d) if (qraw->nb[d] != kraw->nb[d]) return 0;
+    if (qraw->nb[1] != gdn->src[0]->nb[1]) return 0;                  // the kernel keeps the normalized head stride
+    for (const ggml_tensor * t : {gdn->src[0], gdn->src[1], gdn->src[0]->src[0], gdn->src[1]->src[0]}) {
+        if (ggml_cuda_count_uses(g, t) != 1) return 0;
+    }
+    e.q = (const float *) qraw->data; e.k = (const float *) kraw->data;
+    e.sq2 = qraw->nb[2] / sizeof(float); e.sq3 = qraw->nb[3] / sizeof(float);
+    ggml_cuda_gdn_qknorm_put(gdn, e);
+    return 2;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -3824,6 +3866,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_ple_conv_match pm;
         if (node->op == GGML_OP_CONCAT && ggml_cuda_ple_conv_match_at_concat(cgraph, i, pm)) { ggml_cuda_ple_conv_write_tail(*cuda_ctx, pm); return 1; }
         if (node->op == GGML_OP_CONT && ggml_cuda_ple_conv_match_at_tap(cgraph, i, pm)) { ggml_cuda_ple_conv_direct(*cuda_ctx, pm); return pm.silu_idx - i; }
+    }
+    if (node->op == GGML_OP_RMS_NORM) {
+        const int n = ggml_cuda_try_gdn_qknorm(cgraph, i);
+        if (n > 0) { return n - 1; }
+    }
+    if (node->op == GGML_OP_RMS_NORM && i + 2 < cgraph->n_nodes &&
+            ggml_cuda_norm_rope_multi_supported(node, cgraph->nodes[i+1], cgraph->nodes[i+2]) &&
+            ggml_node_has_n_uses(cgraph, i, 1) && ggml_node_has_n_uses(cgraph, i+1, 1) &&
+            (cgraph->nodes[i+2]->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+        ggml_cuda_op_norm_rope_multi(*cuda_ctx, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+        return 2;
     }
     if (node->op == GGML_OP_RMS_NORM) {
         ggml_cuda_norm_gated_match nm;
