@@ -74,6 +74,7 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx, const 
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
+#include "ggml-cuda/fused-gate.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
@@ -3814,6 +3815,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    if (node->op == GGML_OP_CONT) {
+        ggml_cuda_attn_gate_args ag;
+        const int count = ggml_cuda_match_attn_gate(cgraph, i, ag);
+        if (count > 0) { ggml_cuda_op_attn_gate(*cuda_ctx, ag); return count - 1; }
+    }
     if (node->op == GGML_OP_CONCAT || node->op == GGML_OP_CONT) {
         ggml_cuda_ple_conv_match pm;
         if (node->op == GGML_OP_CONCAT && ggml_cuda_ple_conv_match_at_concat(cgraph, i, pm)) { ggml_cuda_ple_conv_write_tail(*cuda_ctx, pm); return 1; }
@@ -3828,6 +3834,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
         sk = ggml_cuda_norm_rows_match_at(cgraph, i, nm);
         if (sk > 0) { ggml_cuda_op_norm_gated(*cuda_ctx, nm); return sk; }
+        ggml_cuda_rms_scale_args ra;
+        const int rc = ggml_cuda_match_rms_scale(cgraph, i, ra);
+        if (rc > 0) { ggml_cuda_op_rms_scale(*cuda_ctx, ra); return rc - 1; }
     }
     if (node->op == GGML_OP_CONCAT || node->op == GGML_OP_SSM_CONV) {
         ggml_cuda_gdn_conv_match gm;
@@ -3849,6 +3858,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const int count = ggml_cuda_hc_mix_closed(cgraph, i + 1, ma);
             if (count > 0 && ma.gate == node && ggml_cuda_hc_gate_mix(*cuda_ctx, w, lo, ma.xn, ma.dst, ma.hc, ma.scale, ma.bias)) return count;
         }
+    }
+
+    if (node->op == GGML_OP_UNARY) {
+        ggml_cuda_sigmul_add_args args;
+        const int count = ggml_cuda_match_sigmul_add(cgraph, i, args);
+        if (count > 0) { ggml_cuda_op_sigmul_add(*cuda_ctx, args); return count - 1; }
     }
 
     if (node->op == GGML_OP_UNARY && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
@@ -5103,6 +5118,27 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 
             // GDN qkv projection: read only by the fused concat-tail + conv pair, which take a BF16 input
             static const bool gdn_x16 = [] { const char * e = getenv("GGML_CUDA_GDN_X16"); return !e || atoi(e) != 0; }();
+            // attention output gate: attn * sigmoid(gate) read only by MMB matmuls -> the fused kernel writes BF16
+            static const bool attn_gate16 = [] { const char * e = getenv("GGML_CUDA_ATTN_GATE16"); return !e || atoi(e) != 0; }();
+            for (int i = 0; attn_gate16 && ggml_cuda_attn_gate_enabled() && i < cgraph->n_nodes; ++i) {
+                if (cgraph->nodes[i]->op != GGML_OP_CONT) continue;
+                ggml_cuda_attn_gate_args ag;
+                if (ggml_cuda_match_attn_gate(cgraph, i, ag) <= 0) continue;
+                const ggml_tensor * d = ag.dst;
+                if (ggml_nrows(d) < 512 || d->ne[0] % 8 != 0) continue;
+                bool ok = true; int nread = 0;
+                for (int n = i + 3; n < cgraph->n_nodes && ok; ++n) {
+                    const ggml_tensor * t = cgraph->nodes[n];
+                    if (!reads(t, d)) continue;
+                    ++nread;
+                    if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE) { if (t->view_offs == 0 && ggml_is_contiguous(t)) continue; ok = false; break; }
+                    if (t->op == GGML_OP_MUL_MAT && t->src[0]->type != GGML_TYPE_F32 && ggml_is_contiguous(t->src[1]) &&
+                        ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t)) continue;
+                    ok = false;
+                }
+                if (ok && nread > 0) ggml_cuda_mmb_mark_half_alloc(d);
+            }
+
             for (int i = 0; gdn_x16 && i < cgraph->n_nodes; ++i) {
                 if (cgraph->nodes[i]->op != GGML_OP_CONCAT) continue;
                 ggml_cuda_gdn_conv_match gm;

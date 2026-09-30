@@ -5308,6 +5308,65 @@ struct test_mul_mat_id : public test_case {
 
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
 // MoE gate/up as two MUL_MAT_ID sharing ids and a broadcast activation, then SWIGLU: the shape the backends fuse
+// GDN q/k l2 norm as built by build_gdn_l2_norm: scale(rms_norm(view, eps/n), 1/sqrt(n)) on strided head rows
+struct test_rms_scale : public test_case {
+    const int64_t D, H, nt;
+    std::string vars() override { return VARS_TO_STR3(D, H, nt); }
+    test_rms_scale(int64_t D = 128, int64_t H = 16, int64_t nt = 64) : D(D), H(H), nt(nt) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * qkv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3*D*H, nt); ggml_set_name(qkv, "qkv");
+        ggml_tensor * k = ggml_view_3d(ctx, qkv, D, H, nt, ggml_element_size(qkv)*D, qkv->nb[1], ggml_element_size(qkv)*D*H);
+        ggml_tensor * out = ggml_scale(ctx, ggml_rms_norm(ctx, k, 1e-6f/D), 1.0f/sqrtf((float) D));
+        ggml_set_name(out, "out");
+        return out;
+    }
+    bool run_whole_graph() override { return true; }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "RMS_SCALE"; }
+};
+
+// Qwen3-Next attention output gate: attn * sigmoid(cont(gate half of the fused Q projection)), optionally feeding
+// a quantized projection (on HIP the fused kernel then writes the product as BF16 for the MMB matmul)
+struct test_attn_gate : public test_case {
+    const int64_t D, H, nt;
+    const bool with_proj;
+    std::string vars() override { return VARS_TO_STR4(D, H, nt, with_proj); }
+    test_attn_gate(int64_t D = 256, int64_t H = 4, int64_t nt = 64, bool with_proj = false) : D(D), H(H), nt(nt), with_proj(with_proj) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * qfull = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*D*H, nt); ggml_set_name(qfull, "qfull");
+        ggml_tensor * attn  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D*H, nt);   ggml_set_name(attn, "attn");
+        ggml_tensor * gate  = ggml_view_3d(ctx, qfull, D, H, nt, ggml_element_size(qfull)*D*2, ggml_element_size(qfull)*D*2*H,
+                                           ggml_element_size(qfull)*D);
+        gate = ggml_cont_2d(ctx, gate, D*H, nt);
+        ggml_tensor * out = ggml_mul(ctx, attn, ggml_sigmoid(ctx, gate));
+        if (with_proj) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, D*H, 256); ggml_set_name(w, "wo");
+            out = ggml_mul_mat(ctx, w, out);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+    double max_nmse_err() override { return with_proj ? 5e-4 : 1e-7; }
+    bool run_whole_graph() override { return true; }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "ATTN_GATE"; }
+};
+
+// gated residual a + b * sigmoid(g) (Qwen3-Next shared expert tail; fused on HIP)
+struct test_sigmul_add : public test_case {
+    const int64_t n, nt;
+    const bool g_row;
+    std::string vars() override { return VARS_TO_STR3(n, nt, g_row); }
+    test_sigmul_add(int64_t n = 2560, int64_t nt = 64, bool g_row = true) : n(n), nt(nt), g_row(g_row) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, nt); ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, nt); ggml_set_name(b, "b");
+        ggml_tensor * g = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, g_row ? 1 : n, nt); ggml_set_name(g, "g");
+        ggml_tensor * out = ggml_add(ctx, a, ggml_mul(ctx, b, ggml_sigmoid(ctx, g))); ggml_set_name(out, "out");
+        return out;
+    }
+    bool run_whole_graph() override { return true; }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "SIGMUL_ADD"; }
+};
+
 struct test_moe_gate_up_glu : public test_case {
     const ggml_type type_a;
     const int n_mats, n_used;
@@ -10501,6 +10560,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // For issue 27873
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 1, 1, false, 1, 8192, 4096));
+    for (int64_t D : {64, 128, 256}) {
+        for (int64_t nt : {1, 7, 513}) {
+            test_cases.emplace_back(new test_rms_scale(D, 16, nt));
+        }
+    }
+    for (int64_t nt : {1, 7, 512, 1024}) {
+        test_cases.emplace_back(new test_attn_gate(256, 4, nt, false));
+        test_cases.emplace_back(new test_attn_gate(256, 4, nt, true));
+    }
+    for (bool gr : {true, false}) {
+        for (int64_t nt : {1, 7, 512}) {
+            test_cases.emplace_back(new test_sigmul_add(2560, nt, gr));
+        }
+    }
 
     for (int k : {1, 63, 65}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, k));
