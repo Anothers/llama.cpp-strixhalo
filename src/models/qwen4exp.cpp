@@ -1008,7 +1008,9 @@ static ggml_tensor * qwen4exp_finish_strips(ggml_context * ctx, ggml_cgraph * gr
 }
 
 static int64_t qwen4exp_query_strip(int64_t n_tokens, int64_t n_stream) {
-    return n_stream == 1 ? std::min<int64_t>(n_tokens, 512) : n_tokens;
+    // LLAMA_QSA_STRIP: queries per indexer strip (score matrix strip x n_blocks f32)
+    static const int64_t strip = [] { const char * e = getenv("LLAMA_QSA_STRIP"); return e ? (int64_t) atoi(e) : (int64_t) 512; }();
+    return n_stream == 1 ? std::min<int64_t>(n_tokens, strip) : n_tokens;
 }
 
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
@@ -1162,6 +1164,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     const int64_t strip = qwen4exp_query_strip(n_tps, n_stream);
     std::vector<ggml_tensor *> selected;
+    // the strips' top-k rows are written in place into one [width, n_tps] tensor; the concat tree copied every row
+    // log2(strips) times (LLAMA_QSA_SETSTRIP=0 keeps it)
+    static const bool set_strip = [] { const char * e = getenv("LLAMA_QSA_SETSTRIP"); return !e || atoi(e) != 0; }();
+    ggml_tensor * placed = nullptr;
+    auto place = [&](ggml_tensor * t, int64_t first, int64_t n_query) {
+        if (!(set_strip && n_stream == 1 && n_tps > strip)) {
+            qwen4exp_append_strip(ctx0,gf,selected,t);
+            return;
+        }
+        if (!placed) {
+            placed = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, t->ne[0], n_tps);
+        }
+        GGML_ASSERT(t->ne[0] == placed->ne[0]);
+        placed = ggml_set_2d_inplace(ctx0, placed, ggml_reshape_2d(ctx0, t, t->ne[0], n_query), placed->nb[1], first*placed->nb[1]);
+        ggml_build_forward_expand(gf, placed);
+    };
     for (int64_t first = 0; first < n_tps; first += strip) {
         const int64_t n_query = std::min(strip, n_tps - first);
         // [QSA_SCORE_BOUNDS] trim the scorer to the blocks this strip can actually see.
@@ -1235,7 +1253,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             ggml_tensor * top_k=qwen4exp_select_complete_blocks(ctx0,score,block_cells,tail,
                     hparams.indexer_top_k/r,r);
             cb(top_k,"indexer_top_k",il);
-            qwen4exp_append_strip(ctx0,gf,selected,top_k);
+            place(top_k,first,n_query);
             continue;
         }
 
@@ -1261,9 +1279,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         // build_attn_qsa reads [n_top_k, n_batch, 1, n_stream], matching the KQ mask.
         top_k = ggml_reshape_4d(ctx0, top_k, width, n_query, 1, n_stream);
         cb(top_k, "indexer_top_k", il);
-        qwen4exp_append_strip(ctx0,gf,selected,top_k);
+        place(top_k,first,n_query);
     }
-    ggml_tensor * top_k = qwen4exp_finish_strips(ctx0,gf,selected);
+    ggml_tensor * top_k = placed ? ggml_reshape_4d(ctx0, placed, placed->ne[0], n_tps, 1, 1)
+                                 : qwen4exp_finish_strips(ctx0,gf,selected);
 
     return top_k;
 }

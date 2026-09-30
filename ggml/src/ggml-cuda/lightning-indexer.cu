@@ -610,24 +610,53 @@ __global__ __launch_bounds__(128) void qsa_indexer_wmma16_keyreg(
     const int warp=threadIdx.y,lane=threadIdx.x,tid=warp*32+lane;
     const int kfirst=int(blockIdx.x)*64,stream=blockIdx.z;
     __shared__ half2 query_tile[16][260];
+    __shared__ float w_tile[16][4];   // the tile's head weights, staged with the queries: the epilogue read them from
+    __shared__ int   lim_tile[16];    // global memory one element at a time, an exposed memory latency per tile
     AB keys[8];
+    // a lane holds the 128 dims of one key: branch-free 16-byte loads of a clamped row, zeroed past nk (the guarded
+    // per-element loads were issued one branch at a time, a serial chain of 64 memory latencies per block)
+    {
+        const int key=kfirst+warp*16+(lane%16);
+        const bool valid=key<s.nk;
+        const char * row=k+size_t(stream)*s.k3+size_t(valid ? key : s.nk-1)*s.k2;
+        if constexpr (std::is_same_v<K,float>) {
+            float4 v[32];
 #pragma unroll
-    for(int part=0;part<8;++part) {
+            for(int i=0;i<32;++i) v[i]=((const float4 *) row)[i];
 #pragma unroll
-        for(int l=0;l<AB::ne;++l) {
-            const int key=kfirst+warp*16+AB::get_i(l),d=part*16+2*AB::get_j(l);
-            float2 value=make_float2(0,0);
-            if(key<s.nk) {
-                const K * src=(const K *)(k+size_t(stream)*s.k3+size_t(key)*s.k2);
-                value=make_float2(float(src[d]),float(src[d+1]));
-            }
-            keys[part].x[l]=__float22half2_rn(value);
+            for(int part=0;part<8;++part)
+#pragma unroll
+                for(int l=0;l<AB::ne;++l) {
+                    const float4 & a=v[part*4+l/2];
+                    const float2 value=valid ? ((l&1) ? make_float2(a.z,a.w) : make_float2(a.x,a.y)) : make_float2(0,0);
+                    keys[part].x[l]=__float22half2_rn(value);
+                }
+        } else {
+            uint4 v[16];
+#pragma unroll
+            for(int i=0;i<16;++i) v[i]=((const uint4 *) row)[i];
+#pragma unroll
+            for(int part=0;part<8;++part)
+#pragma unroll
+                for(int l=0;l<AB::ne;++l) {
+                    const uint4 & a=v[part*2+l/4];
+                    const uint32_t w32=(l&3)==0 ? a.x : (l&3)==1 ? a.y : (l&3)==2 ? a.z : a.w;
+                    keys[part].x[l]=valid ? __builtin_bit_cast(half2,w32) : __float22half2_rn(make_float2(0,0));
+                }
         }
     }
     // the next 16-query tile is fetched into registers (fully unrolled, 16-byte loads when aligned) while the current
     // one is multiplied; the old loop issued 4 scalar loads per iteration under unroll 1, a serial latency chain
     float4 pre[16];
+    float wpre=0.0f; int lpre=0;
     auto fetch=[&](const int qfirst) {
+        if (tid<64) {
+            const int token=qfirst+tid/4;
+            if (w && token<s.nq) wpre=((const float *)(w+size_t(stream)*s.w3+size_t(token)*s.w1))[tid%4];
+        } else if (tid<80) {
+            const int token=qfirst+tid-64;
+            if (lim && token<s.nq) lpre=lim[lim_t+token];
+        }
 #pragma unroll
         for(int it=0;it<16;++it) {
             const int i=tid+it*128,row=i/128,col=4*(i%128),token=qfirst+row;
@@ -639,6 +668,8 @@ __global__ __launch_bounds__(128) void qsa_indexer_wmma16_keyreg(
             pre[it]=value;
         }
     };
+    // the epilogue's keys are fixed per lane (C::get_j depends on the lane only)
+    const int lim_key = (lim && kfirst+warp*16+C::get_j(0)<s.nk) ? lim[kfirst+warp*16+C::get_j(0)] : 0;
     fetch(int(blockIdx.y)*QT*16);
 #pragma unroll 1
     for(int qt=0;qt<QT;++qt) {
@@ -651,6 +682,7 @@ __global__ __launch_bounds__(128) void qsa_indexer_wmma16_keyreg(
         query_tile[row][col/2]=__float22half2_rn(make_float2(pre[it].x,pre[it].y));
         query_tile[row][col/2+1]=__float22half2_rn(make_float2(pre[it].z,pre[it].w));
     }
+    if (tid<64) w_tile[tid/4][tid%4]=wpre; else if (tid<80) lim_tile[tid-64]=lpre;
     __syncthreads();
     if (qt+1<QT) fetch(qfirst+16);
     C acc[4];
@@ -675,7 +707,7 @@ __global__ __launch_bounds__(128) void qsa_indexer_wmma16_keyreg(
         if(token<s.nq && key<s.nk) {
             float value=0.0f;
             if (w) {
-                const float * wr=(const float *)(w+size_t(stream)*s.w3+size_t(token)*s.w1);
+                const float * wr=w_tile[token-qfirst];
 #pragma unroll
                 for(int head=0;head<4;++head) value+=fmaxf(acc[head].x[l],0.0f)*wr[head];
             } else {
@@ -687,7 +719,7 @@ __global__ __launch_bounds__(128) void qsa_indexer_wmma16_keyreg(
                 const half * mr=(const half *)(mask+size_t(stream%s.nm)*s.m3+size_t(token)*s.m1);
                 value+=float(mr[key]);
             }
-            if (lim && !(lim[lim_t+token] > lim[key])) { value=-INFINITY; }
+            if (lim && !(lim_tile[token-qfirst] > lim_key)) { value=-INFINITY; }
             out[key]=value;
         }
     }
@@ -705,6 +737,8 @@ static bool supports_indexer4(int device, const ggml_tensor * dst) {
             q->ne[0] != 128 || q->ne[1] != 4 || k->ne[0] != 128 || k->ne[1] != 1 ||
             q->ne[2] < 1 || q->ne[2] > 262140 || q->ne[3] > 65535 || k->ne[2] > INT_MAX ||
             q->ne[3] != k->ne[3]) { return false; }
+    // the key rows are read with 16-byte loads
+    if (k->nb[2] % 16 || k->nb[3] % 16 || uintptr_t(k->data) % 16) { return false; }
     if (w && (w->type != GGML_TYPE_F32 || w->ne[0] != 4 || w->ne[1] != q->ne[2] ||
             w->ne[2] != 1 || w->ne[3] != q->ne[3])) { return false; }
     if (m && (m->type != GGML_TYPE_F16 || m->ne[0] != k->ne[2] ||
