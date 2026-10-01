@@ -77,6 +77,7 @@ bool ggml_cuda_op_moe_weighted_reduction_sig(ggml_backend_cuda_context & ctx, co
 #include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/fused-gate.cuh"
+#include "ggml-cuda/ple-fused.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
@@ -2127,6 +2128,10 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_SET:
             ggml_cuda_op_set(ctx, dst);
+            break;
+        case GGML_OP_CUSTOM:
+            if (!ggml_cuda_ple_supported(dst)) { return false; }
+            ggml_cuda_op_ple(ctx, dst);
             break;
         case GGML_OP_DUP:
             ggml_cuda_dup(ctx, dst);
@@ -6125,6 +6130,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                        ) &&
                        (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
             } break;
+        case GGML_OP_CUSTOM:
+            return ggml_cuda_ple_supported(op);
         case GGML_OP_SET:
             {
                 const ggml_type t = op->type;

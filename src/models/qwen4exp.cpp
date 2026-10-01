@@ -1972,6 +1972,59 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     return emb;
 }
 
+// PLE mix as three custom ops (the CUDA backend recognizes the userdata tags, see ggml-cuda/ple-fused.cuh); these are
+// the CPU reference implementations. eps rides in op_params right after ggml_custom_op_params {fun, n_tasks, userdata}.
+#define QWEN4EXP_PLE_TAG_GATE ((intptr_t) 0x504c4531)
+#define QWEN4EXP_PLE_TAG_NORM ((intptr_t) 0x504c4532)
+#define QWEN4EXP_PLE_TAG_OUT  ((intptr_t) 0x504c4533)
+static constexpr size_t QWEN4EXP_PLE_EPS_OFFS = sizeof(void *) * 3;   // {fun, int (padded), userdata}
+static float qwen4exp_ple_eps(const ggml_tensor * t) { float e; memcpy(&e, (const char *) t->op_params + QWEN4EXP_PLE_EPS_OFFS, sizeof(float)); return e; }
+
+static void qwen4exp_ple_gate_cpu(ggml_tensor * dst, int ith, int nth, void *) {
+    const ggml_tensor * key = dst->src[0], * hid = dst->src[1], * wk = dst->src[2], * wq = dst->src[3];
+    const int64_t hc = dst->ne[0], T = dst->ne[1], E = key->ne[0] / hc; const float eps = qwen4exp_ple_eps(dst);
+    for (int64_t r = ith; r < hc * T; r += nth) {
+        const int64_t h = r % hc;
+        const float * k = (const float *) key->data + r * E, * q = (const float *) hid->data + r * E;
+        const float * a = (const float *) wk->data + h * E, * b = (const float *) wq->data + h * E;
+        double kk = 0, qq = 0, kq = 0;
+        for (int64_t e = 0; e < E; ++e) { kk += k[e]*k[e]; qq += q[e]*q[e]; kq += (k[e]*a[e])*(q[e]*b[e]); }
+        const float s = (float) kq / sqrtf((float) kk / E + eps) / sqrtf((float) qq / E + eps) / sqrtf((float) E);
+        const float mag = sqrtf(std::max(fabsf(s), 1e-6f)), sg = s > 0 ? 1.f : (s < 0 ? -1.f : 0.f);
+        ((float *) dst->data)[r] = 1.0f / (1.0f + expf(-(sg * mag)));
+    }
+}
+static void qwen4exp_ple_norm_cpu(ggml_tensor * dst, int ith, int nth, void *) {
+    const ggml_tensor * val = dst->src[0], * gate = dst->src[1], * wc = dst->src[2];
+    const int64_t E = val->ne[0], hc = gate->ne[0], T = dst->ne[1]; const float eps = qwen4exp_ple_eps(dst);
+    for (int64_t r = ith; r < hc * T; r += nth) {
+        const int64_t h = r % hc, t = r / hc;
+        const float g = ((const float *) gate->data)[r];
+        const float * v = (const float *) val->data + t * E; const float * w = (const float *) wc->data + h * E;
+        double ss = 0; for (int64_t e = 0; e < E; ++e) { const float x = v[e]*g; ss += x*x; }
+        const float rs = 1.0f / sqrtf((float) ss / E + eps);
+        float * o = (float *) dst->data + r * E;
+        for (int64_t e = 0; e < E; ++e) o[e] = ((v[e]*g)*rs)*w[e];
+    }
+}
+static void qwen4exp_ple_out_cpu(ggml_tensor * dst, int ith, int nth, void *) {
+    const ggml_tensor * hid = dst->src[0], * val = dst->src[1], * gate = dst->src[2], * conv = dst->src[3];
+    const int64_t E = val->ne[0], hc = gate->ne[0], T = dst->ne[1];
+    for (int64_t r = ith; r < hc * T; r += nth) {
+        const int64_t t = r / hc; const float g = ((const float *) gate->data)[r];
+        const float * x = (const float *) hid->data + r * E, * v = (const float *) val->data + t * E, * c = (const float *) conv->data + r * E;
+        float * o = (float *) dst->data + r * E;
+        for (int64_t e = 0; e < E; ++e) o[e] = x[e] + (v[e]*g + c[e]);
+    }
+}
+static ggml_tensor * qwen4exp_ple_custom(ggml_context * ctx, int64_t ne0, int64_t ne1, std::initializer_list<ggml_tensor *> args,
+        ggml_custom_op_t fun, intptr_t tag, float eps) {
+    std::vector<ggml_tensor *> a(args);
+    ggml_tensor * t = ggml_custom_4d(ctx, GGML_TYPE_F32, ne0, ne1, 1, 1, a.data(), (int) a.size(), fun, GGML_N_TASKS_MAX, (void *) tag);
+    memcpy((char *) t->op_params + QWEN4EXP_PLE_EPS_OFFS, &eps, sizeof(float));
+    return t;
+}
+
 ggml_tensor * llama_model_qwen4exp::graph::build_ple(
         llm_graph_input_rs * inp,
         ggml_tensor *        emb,
@@ -1992,6 +2045,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
         return ggml_reshape_3d(ctx0, t, n_embd, hc, n_tokens);
     };
 
+    // LLAMA_PLE_FUSED=0 keeps the elementwise graph
+    static const bool ple_fused = [] { const char * e = getenv("LLAMA_PLE_FUSED"); return !e || atoi(e) != 0; }();
+    ggml_tensor * gate = nullptr, * gated = nullptr, * normalized = nullptr, * v2 = nullptr, * h2 = nullptr;
+    if (ple_fused) {
+        const float eps = hparams.f_norm_rms_eps;
+        auto flat = [&](ggml_tensor * t, int64_t ne0) {
+            return ggml_reshape_2d(ctx0, ggml_is_contiguous(t) ? t : ggml_cont(ctx0, t), ne0, n_tokens);
+        };
+        v2   = flat(value, n_embd);
+        h2   = flat(hidden, hc_dim);   // also the OUT input: built here so it sits before the conv nodes (ple_conv fusion)
+        gate = qwen4exp_ple_custom(ctx0, hc, n_tokens, {flat(key, hc_dim), h2,
+                model.layers[il].ple_norm_key, model.layers[il].ple_norm_query},
+                qwen4exp_ple_gate_cpu, QWEN4EXP_PLE_TAG_GATE, eps);
+        cb(gate, "ple_gate", il);
+        normalized = qwen4exp_ple_custom(ctx0, hc_dim, n_tokens, {v2, gate, model.layers[il].ple_norm_conv},
+                qwen4exp_ple_norm_cpu, QWEN4EXP_PLE_TAG_NORM, eps);
+    } else {
     key = grouped_norm(key, model.layers[il].ple_norm_key);
     ggml_tensor * query = grouped_norm(hidden, model.layers[il].ple_norm_query);
 
@@ -2000,20 +2070,21 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     s = ggml_scale(ctx0, s, 1.0f / sqrtf((float) n_embd));
 
     ggml_tensor * mag  = ggml_sqrt(ctx0, ggml_clamp(ctx0, ggml_abs(ctx0, s), 1e-6f, INFINITY));
-    ggml_tensor * gate = ggml_sigmoid(ctx0, ggml_mul(ctx0, ggml_sgn(ctx0, s), mag));
+    gate = ggml_sigmoid(ctx0, ggml_mul(ctx0, ggml_sgn(ctx0, s), mag));
     cb(gate, "ple_gate", il);
 
     // [n_embd, 1, T] value broadcast across the hc streams, scaled by the gate
     ggml_tensor * v3 = ggml_reshape_3d(ctx0, value, n_embd, 1, n_tokens);
     v3 = ggml_repeat_4d(ctx0, v3, n_embd, hc, n_tokens, 1);
 
-    ggml_tensor * gated = ggml_mul(ctx0, v3, gate);
+    gated = ggml_mul(ctx0, v3, gate);
     cb(gated, "ple_gated_value", il);
 
-    ggml_tensor * normalized = grouped_norm(
+    normalized = grouped_norm(
             ggml_reshape_2d(ctx0, gated, hc_dim, n_tokens),
             model.layers[il].ple_norm_conv);
     normalized = ggml_reshape_2d(ctx0, normalized, hc_dim, n_tokens);
+    }
 
     // depthwise causal conv, dilated by the n-gram size, as a sum of shifted copies
     // ggml_conv_1d_dw is documented as unreliable:
@@ -2062,5 +2133,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     conv_out = ggml_reshape_3d(ctx0, ggml_cont(ctx0, conv_out), n_embd, hc, n_tokens);
     cb(conv_out, "ple_conv_out", il);
 
+    if (ple_fused) {
+        ggml_tensor * out = qwen4exp_ple_custom(ctx0, hc_dim, n_tokens, {h2, v2, gate,
+                ggml_reshape_2d(ctx0, conv_out, hc_dim, n_tokens)}, qwen4exp_ple_out_cpu, QWEN4EXP_PLE_TAG_OUT, 0.0f);
+        return ggml_reshape_3d(ctx0, out, n_embd, hc, n_tokens);
+    }
     return ggml_add(ctx0, hidden, ggml_add(ctx0, gated, conv_out));
 }
