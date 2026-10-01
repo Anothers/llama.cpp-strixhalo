@@ -9,6 +9,18 @@
 #include <vector>
 #include <unordered_set>
 
+// BF16-only / half-alloc marks, one set per CUDA backend context: each llama_context (the target and the MTP draft) has
+// its own backend, and a graph that the scheduler reuses keeps reading the marks its last graph_optimize made. One
+// process-wide set let the draft's re-optimize clear the target's marks, so a reused target graph wrote F32 into
+// half-size BF16 buffers.
+struct ggml_cuda_mmb_marks {
+    std::unordered_set<const ggml_tensor *> bf16_only, half_alloc;
+    bool         after_compute = true;
+    const void * first_split   = nullptr;
+};
+static ggml_cuda_mmb_marks   g_mmb_marks_default;
+static ggml_cuda_mmb_marks * g_mmb_marks = &g_mmb_marks_default;
+
 namespace {
 
 typedef short v16s __attribute__((ext_vector_type(16)));
@@ -594,7 +606,6 @@ __global__ void mmb_build_desc2(const int32_t * __restrict__ bounds, uint32_t * 
 struct mmb_cache_entry { const ggml_tensor * root; const void * data; size_t n; ggml_cuda_pool_alloc<uint16_t> * buf; };
 static std::vector<mmb_cache_entry> g_mmb_cache;
 static mmb_cache_entry g_mmb_slots[4] = {{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr}};
-static std::unordered_set<const ggml_tensor *> g_mmb_bf16_only;
 
 static size_t mmb_cache_max() { return 4; }
 static const ggml_tensor * mmb_root(const ggml_tensor * t) { return t->view_src ? t->view_src : t; }
@@ -762,6 +773,18 @@ bool mmb_glu()     { return true; }
 
 } // namespace
 
+ggml_cuda_mmb_marks * ggml_cuda_mmb_marks_new() { return new ggml_cuda_mmb_marks(); }
+void ggml_cuda_mmb_marks_free(ggml_cuda_mmb_marks * m) { if (g_mmb_marks == m) { g_mmb_marks = &g_mmb_marks_default; } delete m; }
+void ggml_cuda_mmb_marks_select(ggml_cuda_mmb_marks * m) { g_mmb_marks = m ? m : &g_mmb_marks_default; }
+// clear at the first graph_optimize after a compute of this context, or when its first split repeats
+void ggml_cuda_mmb_marks_begin_optimize(const void * first_node) {
+    auto * m = g_mmb_marks;
+    if (m->after_compute || m->first_split == nullptr || first_node == m->first_split) {
+        m->bf16_only.clear(); m->half_alloc.clear(); m->first_split = first_node; m->after_compute = false;
+    }
+}
+void ggml_cuda_mmb_marks_end_compute() { g_mmb_marks->after_compute = true; }
+
 const uint16_t * ggml_cuda_mmb_cache_lookup(const ggml_tensor * t) {
     const ggml_tensor * root = mmb_root(t);
     for (auto & e : g_mmb_slots) if (e.buf && e.root == root && e.data == t->data) return e.buf->get();
@@ -776,14 +799,13 @@ uint16_t * ggml_cuda_mmb_slot_reserve(ggml_backend_cuda_context & ctx, int slot,
     e.root = mmb_root(t); e.data = t->data; e.n = n;
     return e.buf->get();
 }
-static std::unordered_set<const ggml_tensor *> g_mmb_half_alloc;
-void ggml_cuda_mmb_marks_clear() { g_mmb_bf16_only.clear(); g_mmb_half_alloc.clear(); }
+void ggml_cuda_mmb_marks_clear() { g_mmb_marks->bf16_only.clear(); g_mmb_marks->half_alloc.clear(); }
 // bf16-only tensors whose producer never writes F32 into tensor->data: the allocator can give them half the bytes
-void ggml_cuda_mmb_mark_half_alloc(const ggml_tensor * t) { g_mmb_bf16_only.insert(t); g_mmb_half_alloc.insert(t); }
-bool ggml_cuda_mmb_is_half_alloc(const ggml_tensor * t) { return g_mmb_half_alloc.count(t) > 0; }
-size_t ggml_cuda_mmb_marks_count() { return g_mmb_bf16_only.size(); }
-void ggml_cuda_mmb_mark_bf16_only(const ggml_tensor * t) { g_mmb_bf16_only.insert(t); }
-bool ggml_cuda_mmb_is_bf16_only(const ggml_tensor * t) { return g_mmb_bf16_only.count(t) > 0; }
+void ggml_cuda_mmb_mark_half_alloc(const ggml_tensor * t) { g_mmb_marks->bf16_only.insert(t); g_mmb_marks->half_alloc.insert(t); }
+bool ggml_cuda_mmb_is_half_alloc(const ggml_tensor * t) { return g_mmb_marks->half_alloc.count(t) > 0; }
+size_t ggml_cuda_mmb_marks_count() { return g_mmb_marks->bf16_only.size(); }
+void ggml_cuda_mmb_mark_bf16_only(const ggml_tensor * t) { g_mmb_marks->bf16_only.insert(t); }
+bool ggml_cuda_mmb_is_bf16_only(const ggml_tensor * t) { return g_mmb_marks->bf16_only.count(t) > 0; }
 void ggml_cuda_mmb_begin_graph() { for (auto & e : g_mmb_cache) delete e.buf; g_mmb_cache.clear(); for (auto & e : g_mmb_slots) { e.root = nullptr; e.data = nullptr; e.n = 0; } }
 void ggml_cuda_mmb_release_all() {
     ggml_cuda_mmb_begin_graph();

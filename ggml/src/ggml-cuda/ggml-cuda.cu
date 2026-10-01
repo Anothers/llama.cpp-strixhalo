@@ -730,6 +730,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    if (mmb_marks != nullptr) {
+        ggml_cuda_mmb_marks_free(mmb_marks);
+        mmb_marks = nullptr;
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -4940,13 +4944,16 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
-// tracks when a new split sequence starts, so the mmb marks are cleared once per sequence
-static bool         g_gt_after_compute = true;
-static const void * g_gt_first_split   = nullptr;
+
+static void ggml_cuda_select_marks(ggml_backend_cuda_context * cuda_ctx) {
+    if (!cuda_ctx->mmb_marks) { cuda_ctx->mmb_marks = ggml_cuda_mmb_marks_new(); }
+    ggml_cuda_mmb_marks_select(cuda_ctx->mmb_marks);
+}
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_cuda_mmb_begin_graph();
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_select_marks(cuda_ctx);
 
     ggml_cuda_set_device(cuda_ctx->device);
 
@@ -5001,7 +5008,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
 
-    g_gt_after_compute = true;
+    ggml_cuda_mmb_marks_end_compute();
     return GGML_STATUS_SUCCESS;
 }
 
@@ -5032,9 +5039,10 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
 
 static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
-    {   // marks live for the whole scheduled graph (all splits): clear at the first optimize after a compute, or when the first split repeats
-        const void * key = cgraph->n_nodes ? cgraph->nodes[0] : nullptr;
-        if (g_gt_after_compute || g_gt_first_split == nullptr || key == g_gt_first_split) { ggml_cuda_mmb_marks_clear(); g_gt_first_split = key; g_gt_after_compute = false; }
+    {   // marks live for the whole scheduled graph (all splits) of this context: clear at its first optimize after one
+        // of its computes, or when its first split repeats
+        ggml_cuda_select_marks(cuda_ctx);
+        ggml_cuda_mmb_marks_begin_optimize(cgraph->n_nodes ? cgraph->nodes[0] : nullptr);
     }
     {   // HC16 step 2: mark HC normalized-stream (xn) and gate tensors whose consumers all read the BF16 copies
         static const int hc16 = 2;

@@ -12,6 +12,12 @@ uint16_t * ggml_cuda_mmb_cache_reserve(ggml_backend_cuda_context & ctx, const gg
 const uint16_t * ggml_cuda_mmb_cache_lookup(const ggml_tensor * t);
 // producer slots (pinned until the next producer of the same kind): 0 = HC normalized stream xn, 1 = HC gate
 uint16_t * ggml_cuda_mmb_slot_reserve(ggml_backend_cuda_context & ctx, int slot, const ggml_tensor * t, size_t n);
+struct ggml_cuda_mmb_marks;
+ggml_cuda_mmb_marks * ggml_cuda_mmb_marks_new();
+void ggml_cuda_mmb_marks_free(ggml_cuda_mmb_marks * m);
+void ggml_cuda_mmb_marks_select(ggml_cuda_mmb_marks * m);           // the set the mark functions below act on
+void ggml_cuda_mmb_marks_begin_optimize(const void * first_node);
+void ggml_cuda_mmb_marks_end_compute();
 void ggml_cuda_mmb_marks_clear();
 size_t ggml_cuda_mmb_marks_count();
 void ggml_cuda_mmb_mark_bf16_only(const ggml_tensor * t);
