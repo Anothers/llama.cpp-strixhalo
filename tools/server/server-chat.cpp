@@ -382,8 +382,11 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
                 throw std::invalid_argument("messages[" + std::to_string(i) + "] must be an object");
             }
             const json role_v = json_value(msg, "role", json());
-            if (!role_v.is_string() || (role_v.get<std::string>() != "user" && role_v.get<std::string>() != "assistant")) {
-                throw std::invalid_argument("messages[" + std::to_string(i) + "].role must be 'user' or 'assistant'");
+            // system / developer turns inside messages are not part of the Anthropic API, but some clients send them;
+            // the chat template takes mid-conversation system messages, so they are passed through in place
+            const std::string role_s = role_v.is_string() ? role_v.get<std::string>() : std::string();
+            if (role_s != "user" && role_s != "assistant" && role_s != "system" && role_s != "developer") {
+                throw std::invalid_argument("messages[" + std::to_string(i) + "].role must be 'user', 'assistant' or 'system'");
             }
             if (msg.contains("content") && !msg.at("content").is_string() && !msg.at("content").is_array()) {
                 throw std::invalid_argument("messages[" + std::to_string(i) + "].content must be a string or an array of content blocks");
@@ -394,6 +397,23 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
     {
         for (const auto & msg : messages) {
             std::string role = json_value(msg, "role", std::string());
+
+            if (role == "system" || role == "developer") {
+                std::string text;
+                const json c = json_value(msg, "content", json());
+                if (c.is_string()) {
+                    text = c.get<std::string>();
+                } else if (c.is_array()) {
+                    for (const auto & block : c) {
+                        if (block.is_object() && json_value(block, "type", std::string()) == "text") {
+                            if (!text.empty()) { text += "\n"; }
+                            text += json_value(block, "text", std::string());
+                        }
+                    }
+                }
+                oai_messages.push_back({{"role", "system"}, {"content", text}});
+                continue;
+            }
 
             if (!msg.contains("content")) {
                 if (role == "assistant") {
