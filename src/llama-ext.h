@@ -100,6 +100,10 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
+// MTP draft context: the next decodes only write the MTP layer's K/V cache (prompt catch-up far from the prompt end);
+// exact for single-layer heads, whose K/V depend only on the layer input. No logits or hidden states are produced.
+LLAMA_API void llama_set_mtp_kv_only(struct llama_context * ctx, bool value);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);

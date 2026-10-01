@@ -867,7 +867,8 @@ struct llm_graph_params {
         }
 
         // TODO: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448035248
-        if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset) {
+        if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset ||
+            cparams.mtp_kv_only        != other.cparams.mtp_kv_only) {
             return false;
         }
 

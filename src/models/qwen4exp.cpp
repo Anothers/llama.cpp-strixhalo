@@ -589,6 +589,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * h_state = ggml_reshape_3d(ctx0, inp->h, n_embd, hc, n_tokens);
     cb(h_state, "mtp_h_state", il);
 
+    ggml_tensor * inp_embd_unused = inp->embd;   // read by set_input; the kv-only graph gives it a use
     res->add_input(std::move(inp));
 
     ggml_tensor * inp_pos     = build_inp_pos();
@@ -685,6 +686,27 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     const float kq_scale = hparams.f_attention_scale == 0.0f
             ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+
+    if (cparams.mtp_kv_only) {
+        // prompt catch-up far from the prompt end: write this layer's caches and stop. The K/V (and indexer K) depend
+        // only on the layer input, so they are exactly what the full pass would write.
+        if (mctx_hyb && hparams.dsv4_compress_ratios[il] > 0) {
+            build_qsa_store_k(mctx_hyb, cur, il);
+        }
+        ggml_tensor * k_st = Kcur, * v_st = Vcur;
+        if (inp_attn->self_k_rot) { k_st = llama_mul_mat_hadamard(ctx0, k_st, inp_attn->self_k_rot); }
+        if (inp_attn->self_v_rot) { v_st = llama_mul_mat_hadamard(ctx0, v_st, inp_attn->self_v_rot); }
+        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, k_st, inp_attn->get_k_idxs(), il));
+        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, v_st, inp_attn->get_v_idxs(), il));
+        // inputs the skipped part would have read still get set: give them a one-element use so they are allocated
+        for (ggml_tensor * t : { inp_out_ids, inp_embd_unused }) {   // not the KQ mask: an allocated mask is filled on the host
+            if (t) {
+                ggml_tensor * u = ggml_nelements(t) > 1 ? ggml_view_1d(ctx0, t, 1, 0) : t;
+                ggml_build_forward_expand(gf, ggml_scale(ctx0, ggml_cast(ctx0, u, GGML_TYPE_F32), 0.0f));
+            }
+        }
+        return;
+    }
 
     if (mctx_hyb) {
         // the converted GGUF leaves compress_ratios[nextn] = 0, but the sidecar ships blk.N.indexer.* and the

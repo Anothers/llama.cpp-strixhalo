@@ -113,3 +113,6 @@ private:
 using common_speculative_init_result_ptr = std::unique_ptr<common_speculative_init_result>;
 
 common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt);
+
+// MTP: the next common_speculative_process calls only write the draft head's K/V (prompt far from its end)
+void common_speculative_set_prefill_kv_only(bool value);

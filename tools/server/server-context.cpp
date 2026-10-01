@@ -3715,6 +3715,12 @@ private:
                 llama_synchronize(ctx_tgt);
             }
         });
+        if (tdbg && batch_view.n_tokens < 16) {
+            static int64_t t_acc = 0, n_acc = 0;
+            llama_synchronize(ctx_tgt);
+            t_acc += ggml_time_us() - t_dec0;
+            if (++n_acc == 200) { SRV_WRN("tgt small decode avg %.2f ms (n=%d)\n", t_acc / 200.0 / 1e3, batch_view.n_tokens); t_acc = 0; n_acc = 0; }
+        }
         if (tdbg && batch_view.n_tokens >= 512) {
             const int64_t t_dec1 = ggml_time_us();
             llama_synchronize(ctx_tgt);
@@ -3796,11 +3802,16 @@ private:
                 }
             }
         }
-        if (spec && !skip_draft) {
+        // LLAMA_MTP_PREFILL_KV_ONLY=0: those batches skip the draft head entirely (its K/V cache keeps a gap, which
+        // costs every later draft step a full rebuild of the indexer block cache)
+        static const bool mtp_kv_only = [] { const char * e = getenv("LLAMA_MTP_PREFILL_KV_ONLY"); return !e || atoi(e) != 0; }();
+        if (spec && (!skip_draft || mtp_kv_only)) {
             bool ok = true;
+            common_speculative_set_prefill_kv_only(skip_draft);
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch_view);
             });
+            common_speculative_set_prefill_kv_only(false);
 
             if (tdbg) { t_prev_end = ggml_time_us(); }
             if (!ok) {

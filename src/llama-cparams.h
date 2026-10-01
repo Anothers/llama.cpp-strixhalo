@@ -20,6 +20,7 @@ struct llama_cparams {
     int32_t  n_threads_batch; // number of threads to use for batch processing
 
     int32_t  nextn_layer_offset = 0;
+    bool     mtp_kv_only        = false; // MTP head: only write the layer's K/V (+ indexer K), no attention/FFN/head
 
     float rope_freq_base;
     float rope_freq_scale;
