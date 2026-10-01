@@ -13,10 +13,17 @@
 // its own backend, and a graph that the scheduler reuses keeps reading the marks its last graph_optimize made. One
 // process-wide set let the draft's re-optimize clear the target's marks, so a reused target graph wrote F32 into
 // half-size BF16 buffers.
+struct mmb_cache_entry { const ggml_tensor * root; const void * data; size_t n; ggml_cuda_pool_alloc<uint16_t> * buf; };
+// The BF16 activation cache and the producer slots are per context too: the MTP draft context computes on its own
+// stream while the target's queued kernels may still run, so a shared cache let the draft free or overwrite BF16
+// copies the target was reading (nondeterministic target output from the second long request on).
 struct ggml_cuda_mmb_marks {
     std::unordered_set<const ggml_tensor *> bf16_only, half_alloc;
     bool         after_compute = true;
     const void * first_split   = nullptr;
+    std::vector<mmb_cache_entry> cache;
+    mmb_cache_entry slots[4] = {{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr}};
+    size_t slot_cap[4] = {0, 0, 0, 0};
 };
 static ggml_cuda_mmb_marks   g_mmb_marks_default;
 static ggml_cuda_mmb_marks * g_mmb_marks = &g_mmb_marks_default;
@@ -603,22 +610,19 @@ __global__ void mmb_build_desc2(const int32_t * __restrict__ bounds, uint32_t * 
     for (int jt = 0; jt < ts; ++jt) { const int idx = bs + jt; if (idx < nsmall_max) desc_small[idx] = (uint32_t)e | ((uint32_t)jt << 16); }
 }
 
-struct mmb_cache_entry { const ggml_tensor * root; const void * data; size_t n; ggml_cuda_pool_alloc<uint16_t> * buf; };
-static std::vector<mmb_cache_entry> g_mmb_cache;
-static mmb_cache_entry g_mmb_slots[4] = {{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr}};
 
 static size_t mmb_cache_max() { return 4; }
 static const ggml_tensor * mmb_root(const ggml_tensor * t) { return t->view_src ? t->view_src : t; }
 static uint16_t * mmb_cache_insert(ggml_backend_cuda_context & ctx, const ggml_tensor * t, const size_t n) {
-    if (g_mmb_cache.size() >= mmb_cache_max()) { delete g_mmb_cache.front().buf; g_mmb_cache.erase(g_mmb_cache.begin()); }
+    if (g_mmb_marks->cache.size() >= mmb_cache_max()) { delete g_mmb_marks->cache.front().buf; g_mmb_marks->cache.erase(g_mmb_marks->cache.begin()); }
     auto * buf = new ggml_cuda_pool_alloc<uint16_t>(ctx.pool(), n);
-    g_mmb_cache.push_back({mmb_root(t), t->data, n, buf});
+    g_mmb_marks->cache.push_back({mmb_root(t), t->data, n, buf});
     return buf->get();
 }
 static const uint16_t * mmb_bf16_activation(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const size_t n, cudaStream_t stream) {
     const ggml_tensor * root = mmb_root(src1);
-    for (auto & e : g_mmb_slots) if (e.buf && e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
-    for (auto & e : g_mmb_cache) if (e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
+    for (auto & e : g_mmb_marks->slots) if (e.buf && e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
+    for (auto & e : g_mmb_marks->cache) if (e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
     // a producer marked BF16-only (e.g. the fused gated norm) already wrote BF16 into the tensor's own buffer
     if (ggml_cuda_mmb_is_bf16_only(root) && src1->data == root->data && ggml_is_contiguous(src1) && ggml_nelements(root) == (int64_t) n) return (const uint16_t *) src1->data;
     uint16_t * buf = mmb_cache_insert(ctx, src1, n);
@@ -787,15 +791,14 @@ void ggml_cuda_mmb_marks_end_compute() { g_mmb_marks->after_compute = true; }
 
 const uint16_t * ggml_cuda_mmb_cache_lookup(const ggml_tensor * t) {
     const ggml_tensor * root = mmb_root(t);
-    for (auto & e : g_mmb_slots) if (e.buf && e.root == root && e.data == t->data) return e.buf->get();
-    for (auto & e : g_mmb_cache) if (e.root == root && e.data == t->data) return e.buf->get();
+    for (auto & e : g_mmb_marks->slots) if (e.buf && e.root == root && e.data == t->data) return e.buf->get();
+    for (auto & e : g_mmb_marks->cache) if (e.root == root && e.data == t->data) return e.buf->get();
     return nullptr;
 }
-static size_t g_mmb_slot_cap[4] = {0, 0, 0};
 uint16_t * ggml_cuda_mmb_slot_reserve(ggml_backend_cuda_context & ctx, int slot, const ggml_tensor * t, size_t n) {
-    mmb_cache_entry & e = g_mmb_slots[slot];
-    if (e.buf && g_mmb_slot_cap[slot] < n) { delete e.buf; e.buf = nullptr; }
-    if (!e.buf) { e.buf = new ggml_cuda_pool_alloc<uint16_t>(ctx.pool(), n); g_mmb_slot_cap[slot] = n; }
+    mmb_cache_entry & e = g_mmb_marks->slots[slot];
+    if (e.buf && g_mmb_marks->slot_cap[slot] < n) { delete e.buf; e.buf = nullptr; }
+    if (!e.buf) { e.buf = new ggml_cuda_pool_alloc<uint16_t>(ctx.pool(), n); g_mmb_marks->slot_cap[slot] = n; }
     e.root = mmb_root(t); e.data = t->data; e.n = n;
     return e.buf->get();
 }
@@ -806,10 +809,10 @@ bool ggml_cuda_mmb_is_half_alloc(const ggml_tensor * t) { return g_mmb_marks->ha
 size_t ggml_cuda_mmb_marks_count() { return g_mmb_marks->bf16_only.size(); }
 void ggml_cuda_mmb_mark_bf16_only(const ggml_tensor * t) { g_mmb_marks->bf16_only.insert(t); }
 bool ggml_cuda_mmb_is_bf16_only(const ggml_tensor * t) { return g_mmb_marks->bf16_only.count(t) > 0; }
-void ggml_cuda_mmb_begin_graph() { for (auto & e : g_mmb_cache) delete e.buf; g_mmb_cache.clear(); for (auto & e : g_mmb_slots) { e.root = nullptr; e.data = nullptr; e.n = 0; } }
+void ggml_cuda_mmb_begin_graph() { for (auto & e : g_mmb_marks->cache) delete e.buf; g_mmb_marks->cache.clear(); for (auto & e : g_mmb_marks->slots) { e.root = nullptr; e.data = nullptr; e.n = 0; } }
 void ggml_cuda_mmb_release_all() {
     ggml_cuda_mmb_begin_graph();
-    for (int i = 0; i < 4; ++i) { if (g_mmb_slots[i].buf) delete g_mmb_slots[i].buf; g_mmb_slots[i].buf = nullptr; g_mmb_slot_cap[i] = 0; }
+    for (int i = 0; i < 4; ++i) { if (g_mmb_marks->slots[i].buf) delete g_mmb_marks->slots[i].buf; g_mmb_marks->slots[i].buf = nullptr; g_mmb_marks->slot_cap[i] = 0; }
     // the shadow weights are raw cudaMalloc, keyed by data pointer and held for the life of the
     // process. A model has finitely many weights so this never mattered, but a long-lived process
     // that sees many distinct tensors (test-backend-ops) keeps every one of them.

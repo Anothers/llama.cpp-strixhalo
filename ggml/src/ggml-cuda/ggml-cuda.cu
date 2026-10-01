@@ -2483,8 +2483,9 @@ static const char * ggml_backend_cuda_get_name(ggml_backend_t backend) {
 }
 
 static void ggml_backend_cuda_free(ggml_backend_t backend) {
-    ggml_cuda_mmb_release_all();   // release cached BF16 conversions before the pool is destroyed (pool leak assert)
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+    // release this context's cached BF16 conversions before its pool is destroyed (pool leak assert)
+    if (cuda_ctx->mmb_marks) { ggml_cuda_mmb_marks_select(cuda_ctx->mmb_marks); ggml_cuda_mmb_release_all(); }
 
     delete cuda_ctx;
     delete backend;
@@ -4951,9 +4952,9 @@ static void ggml_cuda_select_marks(ggml_backend_cuda_context * cuda_ctx) {
 }
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
-    ggml_cuda_mmb_begin_graph();
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_cuda_select_marks(cuda_ctx);
+    ggml_cuda_mmb_begin_graph();
 
     ggml_cuda_set_device(cuda_ctx->device);
 
