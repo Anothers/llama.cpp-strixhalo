@@ -1,8 +1,8 @@
-ExecStart=/home/zhangde/releases/llama-qwen4exp-hip10-20261001-hb12/bin/llama-server \
+ExecStart=/home/zhangde/releases/llama-qwen4exp-hip10-20261001-hb12c/bin/llama-server \
   -m /data/qwen38-flash-next/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   --mmproj /data/qwen38-flash-next/mmproj-F16.gguf --mmproj-device ROCm0 \
   -md /data/qwen38-flash-next/mtp/mtp-shared-Q8_0.gguf \
-  --spec-type draft-mtp --spec-draft-n-max 2 -ngld 99 --spec-draft-device ROCm0 \
+  --spec-type draft-mtp --spec-draft-n-max 3 -ngld 99 --spec-draft-device ROCm0 -bs \
   -dev ROCm0 -ngl 999 -c 262144 -fa on -fit off -np 1 -b 8192 -ub 8192 \
   -ctk f16 -ctv f16 --no-context-shift --cache-ram 12288 \
   --jinja --chat-template-file /home/zhangde/chat-templates/qwen38-flash-next-midsystem.jinja --reasoning-format auto -t 16 \

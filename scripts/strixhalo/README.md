@@ -1,13 +1,13 @@
-# Qwen3.8-Flash-Next on Strix Halo (gfx1151, ROCm 10) — hb12
+# Qwen3.8-Flash-Next on Strix Halo (gfx1151, ROCm 10) — hb12c
 
 This branch is the build that serves Qwen3.8-Flash-Next UD-Q4_K_XL in production (release `hb12`, 2026-10-01).
-It is upstream llama.cpp plus the `qwen4exp` architecture and HIP prefill/decode work for RDNA3.5.
+Release hb12c (2026-10-01 22:53, MTP --spec-draft-n-max 3, -bs). It is upstream llama.cpp plus the `qwen4exp` architecture and HIP prefill/decode work for RDNA3.5.
 
 ## Measured (same machine, production config, MTP draft on)
 
 | | 8K prefill | 32K prefill | 60K prefill | 200K prefill | code decode | 64K-deep decode |
 |---|---|---|---|---|---|---|
-| hb12 | 1333 | 1425–1440 | 1450 | 1400 | 40.5 | 37.5 |
+| hb12c | 1330–1340 | 1427–1443 | 1440 | 1404 | 45 (n_max 3) | 46 (105K) |
 
 ## Build
 
@@ -43,6 +43,11 @@ solution table (`GGML_CUDA_HBLT_DB`).
 | `GGML_CUDA_MOE_SIGMERGE=0` | Shared-expert merge into the MoE reduction |
 | `LLAMA_PLE_FUSED=0` | PLE custom kernels |
 | `LLAMA_QSA_SETSTRIP=0` | In-place indexer strips |
+
+## Correctness gates (run before every release)
+
+- `spec_correct.sh`: greedy MTP output must equal no-MTP output on six prompts. The only allowed divergence is a near-tie, where the MTP token is rank ≤ 2 in the no-MTP top-5 and within 0.15 nats.
+- `det_test.sh`: three fresh 29K requests in one server process must give identical output. This test caught the cross-stream race fixed by the per-context mmb cache.
 
 ## Tests
 
