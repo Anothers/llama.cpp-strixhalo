@@ -542,7 +542,8 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur        = src->cur;
     dst->cur_p      = src->cur_p;
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
-    dst->rng        = src->rng;
+    // dst->rng is not rewound: the server restores a pre-verify copy before replaying a rejected draft, and a
+    // rewound stream would feed the next verify the same uniforms, which skews the rejection-sampled output
     dst->t_total_us = src->t_total_us;
 }
 
