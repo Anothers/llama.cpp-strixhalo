@@ -4748,6 +4748,9 @@ struct test_gated_delta_net : public test_case {
         return out;
     }
 
+    // the HIP chunked prefill path (S_v 128, >= 64 tokens, scalar gate) feeds f16 WMMA operands
+    double max_nmse_err() override { return head_size == 128 && n_seq_tokens >= 64 && !kda ? 1e-6 : 1e-7; }
+
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (ggml_is_view_op(t->op)) { continue; }
@@ -4796,6 +4799,8 @@ struct test_gdn_qknorm : public test_case {
     }
     bool run_whole_graph() override { return true; }
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "GDN_QKNORM"; }
+    // the HIP chunked prefill path (T >= 64) feeds f16 WMMA operands: ~1.5e-7 NMSE, flat in T
+    double max_nmse_err() override { return T >= 64 ? 1e-6 : 1e-7; }
 };
 
 // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
@@ -10631,6 +10636,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_gdn_qknorm(T, 1));
     }
     test_cases.emplace_back(new test_gdn_qknorm(64, 3));
+    // chunked WMMA prefill path (HIP RDNA3.5): multi-chunk, ragged tail, rollback snapshots
+    for (int64_t T : {80, 1000, 2051}) {
+        for (int64_t K : {1, 4}) {
+            test_cases.emplace_back(new test_gdn_qknorm(T, K));
+        }
+    }
     for (bool im : {true, false}) {
         for (int64_t nt : {1, 7, 513}) {
             test_cases.emplace_back(new test_norm_rope(256, 16, nt, 64, im));
@@ -11502,6 +11513,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  33, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 100, 1, 1, false, true));
 
+    // chunked WMMA prefill path (HIP RDNA3.5): 16 k heads repeated over 48 v heads
+    for (int64_t T : {100, 1027}) {
+        for (int64_t K : {1, 4}) {
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, T, 1, 3, false, false, K));
+        }
+    }
+
     // K > 1: output keeps the last min(n_tokens, K) per-token snapshots, ordered most-recent-first
     // (slot 0 = final state, slot s = state s tokens back).
     // exact-match cases (K == n_seq_tokens):
@@ -12025,6 +12043,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 256, 1)); // PP-256
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 512, 1)); // PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1024, 1)); // PP-1024
+    for (int64_t T : {128, 512, 2048, 8192}) {   // Qwen3.8-Flash-Next shape: 16 k heads x3 -> 48 v heads, fused q/k norm
+        test_cases.emplace_back(new test_gdn_qknorm(T, 4));
+    }
     // Small model configs (fewer heads = less GPU occupancy for autoregressive)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 64, 1));   // 4h PP-64
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 256, 1));  // 4h PP-256

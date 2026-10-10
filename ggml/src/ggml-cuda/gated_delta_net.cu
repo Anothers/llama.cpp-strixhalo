@@ -1,5 +1,6 @@
 #include <unordered_map>
 #include "gated_delta_net.cuh"
+#include "gdn-chunk.cuh"
 #include "common.cuh"
 
 #if defined(GGML_USE_HIP) && (defined(RDNA3) || defined(RDNA4))
@@ -541,6 +542,21 @@ static void ggml_cuda_op_gated_delta_net_impl(
 
     ggml_cuda_gdn_qknorm qkn;
     const bool has_qkn = !kda && ggml_cuda_gdn_qknorm_take(dst, qkn);
+
+    // chunked WMMA prefill (the last K tokens run as single-token chunks so the rollback snapshots stay exact)
+    if (!kda && S_v == 128 && n_seqs == 1 && n_tokens >= 16 + K && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) &&
+            ggml_cuda_gdn_chunk_enabled(n_tokens)) {
+        ggml_cuda_gdn_chunk_args a;
+        a.q = has_qkn ? qkn.q : q_d; a.k = has_qkn ? qkn.k : k_d;
+        a.sq1 = sq1; a.sq2 = has_qkn ? qkn.sq2 : sq2; a.neqk1 = (int) neqk1;
+        a.qkn = has_qkn; a.q_eps = qkn.q_eps; a.q_scale = qkn.q_scale; a.k_eps = qkn.k_eps; a.k_scale = qkn.k_scale;
+        a.v = v_d; a.sv1 = sv1; a.sv2 = sv2;
+        a.g = g_d; a.beta = b_d; a.sb1 = sb1; a.sb2 = sb2;
+        a.s_in = s_d; a.dst = dst_d; a.state = state_d; a.slot_stride = state_slot_stride; a.K = K;
+        a.H = (int) H; a.n_tokens = (int) n_tokens; a.scale = scale;
+        ggml_cuda_gdn_chunk(ctx, a);
+        return;
+    }
     if (has_qkn) {
         GGML_ASSERT(ggml_cuda_gdn_qknorm_eligible(dst));
         if (keep_rs) {
