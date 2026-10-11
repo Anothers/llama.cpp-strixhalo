@@ -897,7 +897,11 @@ bool llama_memory_hybrid_idx_context::qsa_scalar_visibility(const llama_ubatch &
             if (ubatch.pos[i+axis*ubatch.n_tokens]!=ubatch.pos[i]) { return false; }
         }
     }
-    if (ubatch.is_pos_2d()) {
+    // a reservation (full-cache context) with one sequence per stream has no real sequence: the synthetic ubatch
+    // names seq 0, whose image cells would size the dense fallback for a ubatch of another slot. The real ubatch
+    // repeats this check against its own sequence when its graph is built.
+    const bool reserving = mem->get_mem_idx()->get_n_stream() > 1 && i_cur >= qsa_slots.size();
+    if (ubatch.is_pos_2d() && !reserving) {
         const auto & cells=mem->get_mem_idx()->get_cells(seq);
         for (uint32_t j=0;j<get_idx()->get_n_kv();++j) {
             if (!cells.is_empty(j) && cells.seq_has(j,seq) && cells.ext_get(j).is_2d_gt(cells.pos_get(j),cells.pos_get(j))) { return false; }
