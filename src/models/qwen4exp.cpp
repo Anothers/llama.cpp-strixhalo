@@ -602,7 +602,6 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * h_state = ggml_reshape_3d(ctx0, inp->h, n_embd, hc, n_tokens);
     cb(h_state, "mtp_h_state", il);
 
-    ggml_tensor * inp_embd_unused = inp->embd;   // read by set_input; the kv-only graph gives it a use
     res->add_input(std::move(inp));
 
     ggml_tensor * inp_pos     = build_inp_pos();
@@ -635,23 +634,50 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cb(h_norm, "mtp_hnorm", il);
 
     ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
-    e_norm = ggml_repeat_4d(ctx0,
-            ggml_reshape_3d(ctx0, e_norm, n_embd, 1, n_tokens),
-            n_embd, hc, n_tokens, 1);
-    cb(e_norm, "mtp_enorm", il);
 
-    // per stream, not pooled: pooling before the projection discards the hyper-connection residual.
-    ggml_tensor * concat = ggml_concat(ctx0, e_norm, h_norm, /*dim=*/ 0);
-    cb(concat, "mtp_concat", il);
+    // eh_proj acts per stream on [enorm(e); hnorm(h)], and the e half is the same for every stream. Split the weight
+    // into its column halves (views; the boundary falls on a quantization block) and project e once:
+    //     res = W_h * h_norm (all streams as one GEMM) + broadcast(W_e * e_norm)
+    // instead of materializing repeat(e_norm) and the concat ([2*n_embd, hc, n_tokens] F32, 640 MiB at 8192 tokens)
+    // and running the full-width GEMM over hc copies of e. LLAMA_MTP_EH_SPLIT=0 restores the concat form.
+    static const bool eh_split_env = [] { const char * e = getenv("LLAMA_MTP_EH_SPLIT"); return !e || atoi(e) != 0; }();
+    bool eh_split = eh_split_env && n_embd % ggml_blck_size(layer.nextn.eh_proj->type) == 0;
+    for (const auto & lora : *loras) {
+        eh_split = eh_split && lora.first->get_weight(layer.nextn.eh_proj) == nullptr;
+    }
 
-    // The eh projection sees concat as [2*n_embd, hc, n_tokens], so mul_mat batches over the
-    // token axis with only hc(=4) columns per batch and dispatches a 4-column MMVQ. Flattening the
-    // hc and token axes into a single column axis exposes one wide MMQ GEMM instead. The weight is
-    // shared across the merged axes, so the arithmetic is identical up to the kernel's own rounding;
-    // this is the MTP draft head, so it cannot change the target prefill logits.
-    ggml_tensor * concat_flat = ggml_reshape_2d(ctx0, concat, concat->ne[0], concat->ne[1] * concat->ne[2]);
-    ggml_tensor * res_flat    = build_lora_mm(layer.nextn.eh_proj, concat_flat, layer.nextn.eh_proj_s);
-    ggml_tensor * res_hc      = ggml_reshape_3d(ctx0, res_flat, res_flat->ne[0], concat->ne[1], concat->ne[2]);
+    ggml_tensor * res_hc;
+    if (eh_split) {
+        ggml_tensor * w   = layer.nextn.eh_proj;
+        ggml_tensor * w_e = ggml_view_2d(ctx0, w, n_embd, w->ne[1], w->nb[1], 0);
+        ggml_tensor * w_h = ggml_view_2d(ctx0, w, n_embd, w->ne[1], w->nb[1], ggml_row_size(w->type, n_embd));
+        ggml_tensor * p_h = ggml_mul_mat(ctx0, w_h, ggml_reshape_2d(ctx0, h_norm, n_embd, hc * n_tokens));
+        ggml_tensor * p_e = ggml_mul_mat(ctx0, w_e, e_norm);
+        cb(p_e, "mtp_eh_proj_e", il);
+        res_hc = ggml_add_inplace(ctx0, ggml_reshape_3d(ctx0, p_h, w->ne[1], hc, n_tokens),
+                                        ggml_reshape_3d(ctx0, p_e, w->ne[1], 1,  n_tokens));
+        if (layer.nextn.eh_proj_s) {
+            res_hc = ggml_mul(ctx0, res_hc, layer.nextn.eh_proj_s);
+        }
+    } else {
+        e_norm = ggml_repeat_4d(ctx0,
+                ggml_reshape_3d(ctx0, e_norm, n_embd, 1, n_tokens),
+                n_embd, hc, n_tokens, 1);
+        cb(e_norm, "mtp_enorm", il);
+
+        // per stream, not pooled: pooling before the projection discards the hyper-connection residual.
+        ggml_tensor * concat = ggml_concat(ctx0, e_norm, h_norm, /*dim=*/ 0);
+        cb(concat, "mtp_concat", il);
+
+        // The eh projection sees concat as [2*n_embd, hc, n_tokens], so mul_mat batches over the
+        // token axis with only hc(=4) columns per batch and dispatches a 4-column MMVQ. Flattening the
+        // hc and token axes into a single column axis exposes one wide MMQ GEMM instead. The weight is
+        // shared across the merged axes, so the arithmetic is identical up to the kernel's own rounding;
+        // this is the MTP draft head, so it cannot change the target prefill logits.
+        ggml_tensor * concat_flat = ggml_reshape_2d(ctx0, concat, concat->ne[0], concat->ne[1] * concat->ne[2]);
+        ggml_tensor * res_flat    = build_lora_mm(layer.nextn.eh_proj, concat_flat, layer.nextn.eh_proj_s);
+        res_hc = ggml_reshape_3d(ctx0, res_flat, res_flat->ne[0], concat->ne[1], concat->ne[2]);
+    }
     cb(res_hc, "mtp_eh_proj", il);
 
     ggml_tensor * inject = nullptr;
@@ -712,7 +738,10 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, k_st, inp_attn->get_k_idxs(), il));
         ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, v_st, inp_attn->get_v_idxs(), il));
         // inputs the skipped part would have read still get set: give them a one-element use so they are allocated
-        for (ggml_tensor * t : { inp_out_ids, inp_embd_unused }) {   // not the KQ mask: an allocated mask is filled on the host
+        // (not the KQ mask: an allocated mask is filled on the host). inp->embd needs none: set_input writes it only
+        // for embedding batches without tokens, which this graph rejects, so leaving it unallocated keeps two
+        // ring copies of a [hc*n_embd, n_tokens] F32 buffer (640 MiB pinned at 8192 tokens) out of host memory.
+        for (ggml_tensor * t : { inp_out_ids }) {
             if (t) {
                 ggml_tensor * u = ggml_nelements(t) > 1 ? ggml_view_1d(ctx0, t, 1, 0) : t;
                 ggml_build_forward_expand(gf, ggml_scale(ctx0, ggml_cast(ctx0, u, GGML_TYPE_F32), 0.0f));

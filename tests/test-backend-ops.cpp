@@ -7217,6 +7217,61 @@ struct test_topk_moe_lifetime : public test_topk_moe {
     }
 };
 
+// qwen4exp MTP eh projection: eh_proj([repeat_hc(enorm(e)); hnorm(h)]) per hyper-connection stream.
+// split = false: the concat form. split = true: W_h * h over all streams as one GEMM, plus W_e * e computed once
+// and broadcast over the streams, with W_e / W_h column-slice views of the same quantized weight.
+struct test_mtp_eh_proj : public test_case {
+    const ggml_type type_w;
+    const int64_t n_embd;
+    const int64_t hc;
+    const int64_t n_tokens;
+    const bool split;
+
+    std::string vars() override {
+        return VARS_TO_STR5(type_w, n_embd, hc, n_tokens, split);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MTP_EH_PROJ";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_mtp_eh_proj(ggml_type type_w = GGML_TYPE_Q8_0, int64_t n_embd = 256, int64_t hc = 4, int64_t n_tokens = 16, bool split = false)
+        : type_w(type_w), n_embd(n_embd), hc(hc), n_tokens(n_tokens), split(split) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, type_w, 2 * n_embd, n_embd);
+        ggml_set_name(w, "w");
+        ggml_tensor * e = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(e, "e");
+        ggml_tensor * h = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(h, "h");
+
+        ggml_tensor * out;
+        if (!split) {
+            ggml_tensor * er = ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, e, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
+            ggml_tensor * cat = ggml_concat(ctx, er, h, 0);
+            out = ggml_mul_mat(ctx, w, ggml_reshape_2d(ctx, cat, 2 * n_embd, hc * n_tokens));
+            out = ggml_reshape_3d(ctx, out, n_embd, hc, n_tokens);
+        } else {
+            const size_t half = ggml_row_size(type_w, n_embd);
+            ggml_tensor * w_e = ggml_view_2d(ctx, w, n_embd, n_embd, w->nb[1], 0);
+            ggml_tensor * w_h = ggml_view_2d(ctx, w, n_embd, n_embd, w->nb[1], half);
+            ggml_tensor * ph  = ggml_mul_mat(ctx, w_h, ggml_reshape_2d(ctx, h, n_embd, hc * n_tokens));
+            ggml_tensor * pe  = ggml_mul_mat(ctx, w_e, e);
+            out = ggml_add(ctx, ggml_reshape_3d(ctx, ph, n_embd, hc, n_tokens), ggml_reshape_3d(ctx, pe, n_embd, 1, n_tokens));
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_moe_weighted_reduction : public test_case {
     const int64_t n_embd;
     const int64_t n_expert_used;
@@ -11491,6 +11546,48 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // Cover the supported boundaries, common k = 8 shapes, interleaved views and adds, and k = 16 fallback.
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q8_0, 256, 4, 1, false));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q8_0, 256, 4, 1, true));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q8_0, 256, 4, 3, false));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q8_0, 256, 4, 3, true));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q8_0, 256, 4, 16, false));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q8_0, 256, 4, 16, true));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q8_0, 256, 4, 67, false));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q8_0, 256, 4, 67, true));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q8_0, 2560, 4, 1, false));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q8_0, 2560, 4, 1, true));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q8_0, 2560, 4, 4, false));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q8_0, 2560, 4, 4, true));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q8_0, 2560, 4, 512, false));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q8_0, 2560, 4, 512, true));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_F16, 256, 4, 1, false));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_F16, 256, 4, 1, true));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_F16, 256, 4, 3, false));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_F16, 256, 4, 3, true));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_F16, 256, 4, 16, false));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_F16, 256, 4, 16, true));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_F16, 256, 4, 67, false));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_F16, 256, 4, 67, true));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_F16, 2560, 4, 1, false));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_F16, 2560, 4, 1, true));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_F16, 2560, 4, 4, false));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_F16, 2560, 4, 4, true));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_F16, 2560, 4, 512, false));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_F16, 2560, 4, 512, true));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q4_K, 256, 4, 1, false));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q4_K, 256, 4, 1, true));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q4_K, 256, 4, 3, false));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q4_K, 256, 4, 3, true));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q4_K, 256, 4, 16, false));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q4_K, 256, 4, 16, true));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q4_K, 256, 4, 67, false));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q4_K, 256, 4, 67, true));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q4_K, 2560, 4, 1, false));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q4_K, 2560, 4, 1, true));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q4_K, 2560, 4, 4, false));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q4_K, 2560, 4, 4, true));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q4_K, 2560, 4, 512, false));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q4_K, 2560, 4, 512, true));
     test_cases.emplace_back(new test_moe_weighted_reduction(63,  2, 17));
     test_cases.emplace_back(new test_moe_weighted_reduction(2048, 8, 128));
     test_cases.emplace_back(new test_moe_weighted_reduction(2048, 8, 128, false, true));
@@ -11617,6 +11714,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
     // fused weighted expert sum, out-of-place vs in-place product (both should hit the fused kernel)
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q8_0, 2560, 4, 1, false));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q8_0, 2560, 4, 1, true));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q8_0, 2560, 4, 4, false));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q8_0, 2560, 4, 4, true));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q8_0, 2560, 4, 4096, false));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q8_0, 2560, 4, 4096, true));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q8_0, 2560, 4, 8192, false));
+    test_cases.emplace_back(new test_mtp_eh_proj(GGML_TYPE_Q8_0, 2560, 4, 8192, true));
     test_cases.emplace_back(new test_moe_weighted_reduction(2560, 10, 4096, false, false, false, false));
     test_cases.emplace_back(new test_moe_weighted_reduction(2560, 10, 4096, false, false, false, true));
 
