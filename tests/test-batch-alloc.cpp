@@ -286,6 +286,63 @@ static void test_init(testing & t) {
 static void test_split(testing & t) {
     llama_vocab vocab;
 
+    t.test("embedding_ubatches_keep_live_owners", [&](testing & t) {
+        llama_batch_allocr ba(1);
+        batch_builder first(3);
+        first.add(0, {0}, false);
+        first.add(1, {0}, true);
+        t.assert_true(ba.init(first.make(), vocab, nullptr, first.n_embd, 4, false));
+        llama_ubatch a = ba.split_simple(2);
+        auto * first_owner = a.data.get();
+
+        batch_builder second(3);
+        second.add(0, {2}, true);
+        for (auto & value : second.embd) { value += 500.0f; }
+        t.assert_true(ba.init(second.make(), vocab, nullptr, second.n_embd, 4, false));
+        llama_ubatch b = ba.split_simple(2);
+        t.assert_true("live owners use different storage", a.data != b.data);
+        t.assert_equal(0.0f, a.embd[0]);
+        t.assert_equal(102.0f, a.embd[5]);
+        t.assert_equal(0, a.seq_id[0][0]);
+        t.assert_equal(500.0f, b.embd[0]);
+
+        a = {};
+        batch_builder third(3);
+        third.add(0, {3}, false);
+        for (auto & value : third.embd) { value += 1000.0f; }
+        t.assert_true(ba.init(third.make(), vocab, nullptr, third.n_embd, 4, false));
+        llama_ubatch c = ba.split_simple(2);
+        t.assert_true("released storage is reused", c.data.get() == first_owner);
+        t.assert_equal(1000.0f, c.embd[0]);
+        t.assert_equal(1002.0f, c.embd[2]);
+        t.assert_equal(500.0f, b.embd[0]);
+        t.assert_equal(2, b.seq_id[0][0]);
+        t.assert_equal(-1, c.seq_idx[0]);
+        t.assert_equal(0, c.seq_idx[3]);
+        t.assert_equal(0, (int) c.output[0]);
+    });
+
+    t.test("embedding_reuse_clears_sequence_metadata", [&](testing & t) {
+        llama_batch_allocr ba(1);
+        batch_builder first;
+        first.add(0, {0, 1}, true);
+        t.assert_true(ba.init(first.make(), vocab, nullptr, first.n_embd, 4, false));
+        llama_ubatch a = ba.split_simple(2);
+        a = {};
+
+        batch_builder second;
+        second.add(0, {2}, false);
+        t.assert_true(ba.init(second.make(), vocab, nullptr, second.n_embd, 4, false));
+        llama_ubatch b = ba.split_simple(2);
+        t.assert_equal(1, b.n_seq_id[0]);
+        t.assert_equal(2, b.seq_id[0][0]);
+        t.assert_equal(1u, b.n_seqs_unq);
+        t.assert_equal(-1, b.seq_idx[0]);
+        t.assert_equal(-1, b.seq_idx[1]);
+        t.assert_equal(0, b.seq_idx[2]);
+        t.assert_equal(0, (int) b.output[0]);
+    });
+
     t.test("split_simple_chunks", [&](testing & t) {
         batch_builder bb;
         for (int i = 0; i < 5; ++i) {

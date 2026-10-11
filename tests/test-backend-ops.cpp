@@ -4214,10 +4214,13 @@ struct test_snake_fuse : public test_case {
 struct test_hc_f32_consumer : public test_case {
     const int tokens;
     const ggml_type type_w;
+    const bool extra_f32;
+    const int outputs;
 
-    test_hc_f32_consumer(int tokens, ggml_type type_w) : tokens(tokens), type_w(type_w) {}
+    test_hc_f32_consumer(int tokens, ggml_type type_w, bool extra_f32 = false, int outputs = 4)
+        : tokens(tokens), type_w(type_w), extra_f32(extra_f32), outputs(outputs) {}
     std::string op_desc(ggml_tensor *) override { return "HC_F32_CONSUMER"; }
-    std::string vars() override { return VARS_TO_STR2(tokens, type_w); }
+    std::string vars() override { return VARS_TO_STR4(tokens, type_w, extra_f32, outputs); }
     bool run_whole_graph() override { return true; }
     bool use_scheduler_allocation() override { return true; }
     double max_nmse_err() override { return type_w == GGML_TYPE_F32 ? 1e-5 : 5e-4; }
@@ -4237,9 +4240,15 @@ struct test_hc_f32_consumer : public test_case {
         norm = ggml_reshape_2d(ctx, norm, embd * hc, tokens);
         norm = ggml_mul(ctx, norm, gamma);
         ggml_set_name(norm, "test_hc_norm");
-        auto * projection = ggml_new_tensor_2d(ctx, type_w, embd * hc, 4);
+        auto * projection = ggml_new_tensor_2d(ctx, type_w, embd * hc, outputs);
         ggml_set_name(projection, "test_hc_projection");
-        return ggml_mul_mat(ctx, projection, norm);
+        auto * first = ggml_mul_mat(ctx, projection, norm);
+        if (!extra_f32) return first;
+        // The fused projection must leave F32 xn available to this sibling reader.
+        if (gf) ggml_build_forward_expand(gf, first);
+        auto * sibling_w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, embd * hc, 5);
+        ggml_set_name(sibling_w, "test_hc_sibling_projection");
+        return ggml_concat(ctx, first, ggml_mul_mat(ctx, sibling_w, norm), 0);
     }
 };
 
@@ -11581,6 +11590,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_hc_f32_consumer(tokens, type));
         }
     }
+    for (int tokens : {512, 513}) {
+        test_cases.emplace_back(new test_hc_f32_consumer(tokens, GGML_TYPE_F32, true));
+        test_cases.emplace_back(new test_hc_f32_consumer(tokens, GGML_TYPE_F32, false, 5));
+    }
 
     return test_cases;
 }
@@ -12043,6 +12056,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 256, 1)); // PP-256
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 512, 1)); // PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1024, 1)); // PP-1024
+    // Qwen3.8-Flash-Next dense shapes (Q8_0): MTP eh_proj over hc x T columns, and the 2560-wide projections
+    for (auto mkn : std::vector<std::array<int64_t,3>>{{2560, 5120, 32768}, {2560, 5120, 8192}, {2560, 2560, 32768}, {2560, 2560, 8192}}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mkn[0], mkn[2], mkn[1], {1, 1}, {1, 1}));
+    }
     for (int64_t T : {128, 512, 2048, 8192}) {   // Qwen3.8-Flash-Next shape: 16 k heads x3 -> 48 v heads, fused q/k norm
         test_cases.emplace_back(new test_gdn_qknorm(T, 4));
     }

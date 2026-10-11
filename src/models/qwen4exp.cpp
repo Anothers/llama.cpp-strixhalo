@@ -355,6 +355,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         ggml_is_matrix(w_down) && ggml_is_matrix(w_inject) &&
         ggml_is_contiguous(w_down) && ggml_is_contiguous(w_inject) &&
         w_down->ne[0] == w_inject->ne[0];
+    // Place the small F32 injection immediately after the norm so the HIP
+    // backend can fuse it while the unrounded normalized values are in registers.
+    static const bool norm_project = [] {
+        const char * e = getenv("GGML_CUDA_HC_NORM_PROJECT");
+        return e && atoi(e) != 0;
+    }();
+    const bool early_inject = norm_project && nt >= 512 && hc == 4 && inject &&
+        loras->empty() && w_inject->type == GGML_TYPE_F32 && ggml_is_contiguous(w_inject) &&
+        w_inject->ne[0] == hc_dim && w_inject->ne[1] == 4;
+    if (early_inject) {
+        *inject = build_lora_mm(w_inject, xn);
+        ggml_build_forward_expand(gf, *inject);
+    }
     ggml_tensor * lo;
     if (pack_di) {
         ggml_build_forward_expand(gf, xn);
@@ -390,7 +403,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     cb(mixed, "hc_mixed", il);
 
     if (inject) {
-        if (!pack_di) {
+        if (!pack_di && !early_inject) {
             *inject = build_lora_mm(w_inject, xn);
         }
         cb(*inject, "hc_inject", il);
@@ -1795,6 +1808,8 @@ public:
     // scratch, reused across set_input() calls
     std::vector<llama_token> prev;
     std::vector<uint8_t> staging;
+    std::vector<int32_t> indices;
+    std::vector<int64_t> window;
 };
 
 // Prefetch hook: the chunk-boundary stall is the PLE row gather (257k-393k scattered 90-byte reads, ~300 ms with the
@@ -1838,6 +1853,9 @@ void qwen4exp_ple_prefetch(const llama_model & model_base, const llama_token * t
 
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     const auto & hp = pmodel.hparams;
+    static const bool timing = [] { const char * e = getenv("LLAMA_PLE_TIMING"); return e && atoi(e) != 0; }();
+    static const bool staging_pool = [] { const char * e = getenv("LLAMA_PLE_STAGING_POOL"); return e && atoi(e) != 0; }();
+    const int64_t t0 = timing ? ggml_time_us() : 0;
 
     // an image arrives as an embd batch, so ubatch->token is null, but every position still needs a row for ggml_get_rows
     // stand in the image token id that the reference hashes, or EOS if the file has no such key
@@ -1856,7 +1874,9 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     const int64_t eos      = hp.ple_eos_token_id;
     const int64_t n_prev   = n_gram - 1;
 
-    std::vector<int32_t> idx(n_heads * n_tokens);
+    indices.resize(n_heads * n_tokens);
+    window.resize(n_gram);
+    auto & idx = indices;
 
     GGML_ASSERT(mctx != nullptr);
 
@@ -1867,12 +1887,13 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
 
     // predecessors come from the KV cells (ext.tok); apply_ubatch() already stored this ubatch, so its own tokens count too
     mctx->get_prev_tokens(*ubatch, n_prev, prev);
+    const int64_t t_prev = timing ? ggml_time_us() : 0;
 
     for (int64_t i = 0; i < n_tokens; ++i) {
         // an EOS in the window resets everything at or before it
         // a missing predecessor (before the sequence start, or no cached cell) reads as EOS
         // the EOS of the token itself does not cut its own context, as in the reference
-        std::vector<int64_t> ctx(n_gram);
+        auto & ctx = window;
         ctx[0] = tok_of(i);
         bool cut = false;
         for (int64_t s = 1; s < n_gram; ++s) {
@@ -1896,12 +1917,31 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         }
     }
 
+    const int64_t t_hash = timing ? ggml_time_us() : 0;
+    int64_t t_alloc = t_hash;
+    int64_t t_gather = t_hash;
     if (pmodel.ple_reader) {
-        staging.resize(idx.size() * pmodel.ple_reader->head_dim * sizeof(float));
-        pmodel.ple_reader->gather(idx.data(), (int64_t) idx.size(), (float *) staging.data());
-        ggml_backend_tensor_set(data, staging.data(), 0, staging.size());
+        const size_t count = idx.size() * pmodel.ple_reader->head_dim;
+        std::shared_ptr<std::vector<float>> lease;
+        float * output;
+        if (staging_pool) {
+            lease = pmodel.ple_reader->acquire_staging(count);
+            output = lease->data();
+        } else {
+            staging.resize(count * sizeof(float));
+            output = (float *) staging.data();
+        }
+        if (timing) { t_alloc = ggml_time_us(); }
+        pmodel.ple_reader->gather(idx.data(), (int64_t) idx.size(), output);
+        if (timing) { t_gather = ggml_time_us(); }
+        ggml_backend_tensor_set(data, output, 0, count * sizeof(float));
     } else {
         ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+    }
+    if (timing && n_tokens >= 512) {
+        const int64_t end = ggml_time_us();
+        LLAMA_LOG_WARN("ple timing n=%lld: prev %.1f hash %.1f alloc %.1f gather %.1f upload %.1f total %.1f ms\n",
+                (long long) n_tokens, (t_prev - t0)/1e3, (t_hash - t_prev)/1e3, (t_alloc - t_hash)/1e3, (t_gather - t_alloc)/1e3, (end - t_gather)/1e3, (end - t0)/1e3);
     }
 }
 

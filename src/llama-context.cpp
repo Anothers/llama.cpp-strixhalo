@@ -580,7 +580,7 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     }
 }
 
-void llama_context::sched_reserve() {
+void llama_context::sched_reserve(uint32_t n_tokens_hint) {
     if (!sched_need_reserve) {
         return;
     }
@@ -594,9 +594,11 @@ void llama_context::sched_reserve() {
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
-    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t n_tokens_max = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t n_tokens = n_tokens_hint ? std::min(n_tokens_max, n_tokens_hint) : n_tokens_max;
 
-    const size_t max_nodes = this->graph_max_nodes(n_tokens);
+    // Keep graph capacity for later large batches, but allocate for the current batch.
+    const size_t max_nodes = this->graph_max_nodes(n_tokens_max);
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
@@ -1352,6 +1354,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
 
+    // LLAMA_UBATCH_TIMING=1: host-side phase times of large ubatches (build / alloc / set_inputs / compute launch)
+    static const bool ub_tim = [] { const char * e = getenv("LLAMA_UBATCH_TIMING"); return e && atoi(e) != 0; }();
+    const int64_t ut0 = ub_tim ? ggml_time_us() : 0;
+    int64_t ut_build = 0, ut_alloc = 0;
+    bool ut_reused = false;
+
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
@@ -1362,6 +1370,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_sched_prepare_inputs(sched.get());
 
         n_reused++;
+        ut_reused = true;
     } else {
         res->reset();
 
@@ -1371,6 +1380,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         gf = model.build_graph(gparams);
+        if (ub_tim) { ut_build = ggml_time_us(); }
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1385,7 +1395,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+        if (ub_tim) { ut_alloc = ggml_time_us(); }
     }
+    const int64_t ut_prep = ub_tim ? ggml_time_us() : 0;
 
     // set the input data for the input tensors
     {
@@ -1397,7 +1409,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const int64_t ut_inp = ub_tim ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (ub_tim && ubatch.n_tokens >= 512) {
+        const int64_t ut_end = ggml_time_us();
+        LLAMA_LOG_WARN("ubatch timing [ctx %p] n=%u: %s build %.1f alloc %.1f | set_inputs %.1f | compute launch %.1f ms (nodes %d)\n",
+            (void *) this, ubatch.n_tokens, ut_reused ? "REUSED" : "new",
+            ut_build ? (ut_build - ut0)/1e3 : 0.0, ut_alloc ? (ut_alloc - ut_build)/1e3 : 0.0,
+            (ut_inp - ut_prep)/1e3, (ut_end - ut_inp)/1e3, ggml_graph_n_nodes(res->get_gf()));
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1652,6 +1672,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
 
+    static const bool decode_timing = [] { const char * e = getenv("LLAMA_DECODE_TIMING"); return e && atoi(e) != 0; }();
+    const bool dt = decode_timing && batch_inp.n_tokens >= 512;
+    const int64_t dt0 = dt ? ggml_time_us() : 0;
+    int64_t dt_graph = 0, dt_extract = 0;
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -1714,6 +1739,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
+    const int64_t dt_batch = dt ? ggml_time_us() : 0;
 
     {   // warm the page cache for this batch's per-layer-embedding rows while the first chunk is on the GPU;
         // posix_fadvise only, so a wrong prediction costs readahead and nothing else
@@ -1721,6 +1747,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         if (batch_inp.token && batch_inp.n_tokens >= 4096) { qwen4exp_ple_prefetch(model, batch_inp.token, batch_inp.n_tokens); }
     }
     const uint32_t n_outputs_all = balloc->get_n_outputs();
+    const int64_t dt_prefetch = dt ? ggml_time_us() : 0;
 
     if (output_all) {
         // require that all tokens are output
@@ -1749,12 +1776,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     output_swaps.clear();
 
-    sched_reserve();
+    sched_reserve(n_tokens_all);
 
     bool did_optimize = false;
 
     // handle any pending shifts/copies
     memory_update(false);
+    const int64_t dt_reserve = dt ? ggml_time_us() : 0;
 
     llama_memory_context_ptr mctx;
 
@@ -1801,6 +1829,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         break;
     }
 
+    const int64_t dt_memory = dt ? ggml_time_us() : 0;
+
     // reserve output buffer
     if (output_reserve(n_outputs_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
@@ -1814,6 +1844,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
+    const int64_t dt_output = dt ? ggml_time_us() : 0;
 
     do {
         const auto & ubatch = mctx->get_ubatch();
@@ -1836,7 +1867,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         ggml_status status;
 
+        const int64_t dt_before_graph = dt ? ggml_time_us() : 0;
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        const int64_t dt_after_graph = dt ? ggml_time_us() : 0;
+        dt_graph += dt_after_graph - dt_before_graph;
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -1990,6 +2024,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
+        if (dt) { dt_extract += ggml_time_us() - dt_after_graph; }
     } while (mctx->next());
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
@@ -2044,6 +2079,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    if (dt) {
+        const int64_t dt_end = ggml_time_us();
+        LLAMA_LOG_WARN("decode timing [ctx %p type %d] n=%d: batch %.1f prefetch %.1f reserve %.1f memory %.1f output %.1f graph %.1f extract %.1f other %.1f total %.1f ms\n",
+            (void *) this, (int) cparams.ctx_type, batch_inp.n_tokens,
+            (dt_batch-dt0)/1e3, (dt_prefetch-dt_batch)/1e3, (dt_reserve-dt_prefetch)/1e3,
+            (dt_memory-dt_reserve)/1e3, (dt_output-dt_memory)/1e3, dt_graph/1e3, dt_extract/1e3,
+            (dt_end-dt_output-dt_graph-dt_extract)/1e3, (dt_end-dt0)/1e3);
+    }
 
     return 0;
 }

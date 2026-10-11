@@ -159,7 +159,7 @@ static __global__ void __launch_bounds__(128) gdn_chunk_prep(const ggml_cuda_gdn
 #endif
 }
 
-template <bool NQK>
+template <bool NQK, bool PACK_PREFETCH>
 static __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(6)))
 gdn_chunk_main(const ggml_cuda_gdn_chunk_args a, const gdc_sched sc, const int nch, const gdc_aux * __restrict__ aux0) {
 #ifdef GDN_CHUNK_DEVICE
@@ -188,6 +188,7 @@ gdn_chunk_main(const ggml_cuda_gdn_chunk_args a, const gdc_sched sc, const int n
 
     // staging: thread -> row tid>>4, elements [8*(tid&15), +8); V: own accumulator elements
     float4 pk[2], pq[2]; float pv[8];
+    gdc_v8h pk16, pq16;
     auto prefetch = [&](int c, int tid, int h, int col) {
         int start, len;
         sc.get(c, start, len);
@@ -200,6 +201,25 @@ gdn_chunk_main(const ggml_cuda_gdn_chunk_args a, const gdc_sched sc, const int n
             const float4 x = *(const float4 *)(kh + off + 4*j), y = *(const float4 *)(qh + off + 4*j);
             pk[j] = make_float4(x.x*m, x.y*m, x.z*m, x.w*m);
             pq[j] = make_float4(y.x*m, y.y*m, y.z*m, y.w*m);
+        }
+        if constexpr (PACK_PREFETCH) {
+            float rk = 1.f, rq = 1.f;
+            if constexpr (NQK) {
+                float sk = 0.f, sq = 0.f;
+#pragma unroll
+                for (int j = 0; j < 2; ++j) {
+                    sk += pk[j].x*pk[j].x + pk[j].y*pk[j].y + pk[j].z*pk[j].z + pk[j].w*pk[j].w;
+                    sq += pq[j].x*pq[j].x + pq[j].y*pq[j].y + pq[j].z*pq[j].z + pq[j].w*pq[j].w;
+                }
+#pragma unroll
+                for (int d = 1; d < 16; d <<= 1) { sk += __shfl_xor(sk, d, 16); sq += __shfl_xor(sq, d, 16); }
+                rk = s < len ? rsqrtf(sk/GDC_SV + a.k_eps)*a.k_scale : 0.f;
+                rq = s < len ? rsqrtf(sq/GDC_SV + a.q_eps)*a.q_scale : 0.f;
+            }
+            const float kk[8] = {pk[0].x, pk[0].y, pk[0].z, pk[0].w, pk[1].x, pk[1].y, pk[1].z, pk[1].w};
+            const float qq[8] = {pq[0].x, pq[0].y, pq[0].z, pq[0].w, pq[1].x, pq[1].y, pq[1].z, pq[1].w};
+#pragma unroll
+            for (int u = 0; u < 8; ++u) { pk16[u] = (_Float16)(kk[u]*rk); pq16[u] = (_Float16)(qq[u]*rq); }
         }
 #pragma unroll
         for (int e = 0; e < 8; ++e) {
@@ -221,6 +241,10 @@ gdn_chunk_main(const ggml_cuda_gdn_chunk_args a, const gdc_sched sc, const int n
         // ---- stage K, Q, K^T (l2-normalized if NQK) into LDS ----
         {
             const int s = tid >> 4, cc = 8*(tid & 15);
+            gdc_v8h kv, qv;
+            if constexpr (PACK_PREFETCH) {
+                kv = pk16; qv = pq16;
+            } else {
             float rk = 1.f, rq = 1.f;
             if constexpr (NQK) {
                 float sk = 0.f, sq = 0.f;
@@ -236,9 +260,9 @@ gdn_chunk_main(const ggml_cuda_gdn_chunk_args a, const gdc_sched sc, const int n
             }
             const float kk[8] = {pk[0].x, pk[0].y, pk[0].z, pk[0].w, pk[1].x, pk[1].y, pk[1].z, pk[1].w};
             const float qq[8] = {pq[0].x, pq[0].y, pq[0].z, pq[0].w, pq[1].x, pq[1].y, pq[1].z, pq[1].w};
-            gdc_v8h kv, qv;
 #pragma unroll
             for (int u = 0; u < 8; ++u) { kv[u] = (_Float16)(kk[u]*rk); qv[u] = (_Float16)(qq[u]*rq); }
+            }
             *(uint4 *)&Ksh[s][cc] = __builtin_bit_cast(uint4, kv);
             *(uint4 *)&Qsh[s][cc] = __builtin_bit_cast(uint4, qv);
 #pragma unroll
@@ -276,7 +300,9 @@ gdn_chunk_main(const ggml_cuda_gdn_chunk_args a, const gdc_sched sc, const int n
         // ---- D = T' (V - e^gcs kS);  out = e^gcs qS + QKm D ----
         gdc_v8f rhs;
 #pragma unroll
-        for (int e = 0; e < 8; ++e) { rhs[e] = vreg[e] - ea[e]*kS[e]; qS[e] *= ea[e]; }
+        for (int e = 0; e < 8; ++e) {
+            rhs[e] = vreg[e] - ea[e]*kS[e]; qS[e] *= ea[e];
+        }
         gdc_v8f D = {};
         D = GDC_WMMA(tf, gdc_c_to_op(rhs, h), D);
         const gdc_v8f o = GDC_WMMA(qm, gdc_c_to_op(D, h), qS);
@@ -340,12 +366,14 @@ void ggml_cuda_gdn_chunk(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_ch
     ggml_cuda_pool_alloc<gdc_aux> aux(ctx.pool(), (size_t) a.H*nch);
     cudaStream_t stream = ctx.stream();
     const dim3 pgrid(a.H, (nch + 3)/4);
+    static const bool packed = [] { const char * e = getenv("GGML_CUDA_GDN_PACK_PREFETCH"); return e && atoi(e) != 0; }();
     if (a.qkn) {
         gdn_chunk_prep<true><<<pgrid, 128, 0, stream>>>(a, sc, nch, aux.get());
-        gdn_chunk_main<true><<<a.H, 256, 0, stream>>>(a, sc, nch, aux.get());
+        if (packed) gdn_chunk_main<true, true><<<a.H, 256, 0, stream>>>(a, sc, nch, aux.get());
+        else        gdn_chunk_main<true, false><<<a.H, 256, 0, stream>>>(a, sc, nch, aux.get());
     } else {
         gdn_chunk_prep<false><<<pgrid, 128, 0, stream>>>(a, sc, nch, aux.get());
-        gdn_chunk_main<false><<<a.H, 256, 0, stream>>>(a, sc, nch, aux.get());
+        gdn_chunk_main<false, false><<<a.H, 256, 0, stream>>>(a, sc, nch, aux.get());
     }
     CUDA_CHECK(cudaGetLastError());
 }

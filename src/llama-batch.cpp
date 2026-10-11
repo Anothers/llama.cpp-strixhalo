@@ -751,20 +751,35 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
 
     assert(n_tokens%n_seqs == 0);
 
-    auto udata = std::make_shared<llama_ubatch::data_t>();
+    static const bool reuse_embd = [] { const char * e = getenv("LLAMA_BATCH_EMBD_POOL"); return !e || atoi(e) != 0; }();
+    std::shared_ptr<llama_ubatch::data_t> udata;
+    if (batch.embd && reuse_embd) {
+        for (auto & cached : embd_pool) {
+            if (cached.use_count() == 1) {
+                udata = cached;
+                break;
+            }
+        }
+    }
+    if (!udata) {
+        udata = std::make_shared<llama_ubatch::data_t>();
+        if (batch.embd && reuse_embd && embd_pool.size() < 2) { embd_pool.push_back(udata); }
+    }
 
     const int64_t n_embd_all = batch.embd ? (int64_t) n_tokens*n_embd : 0;
     const int64_t n_pos_all  =              (int64_t) n_tokens*n_pos_per_embd;
 
     udata->token     .resize(n_tokens);
-    udata->embd      .resize(n_embd_all);
+    // Each used row is overwritten below. Keep the allocation for later embedding batches.
+    if (udata->embd.size() < (size_t) n_embd_all) { udata->embd.resize(n_embd_all); }
     udata->pos       .resize(n_pos_all);
     udata->n_seq_id  .resize(n_tokens);
     udata->seq_id    .resize(n_tokens);
     udata->seq_id_unq.resize(0);
-    udata->seq_idx   .resize(LLAMA_MAX_SEQ, -1);
+    udata->seq_idx   .assign(LLAMA_MAX_SEQ, -1);
     udata->output    .resize(n_tokens);
 
+    udata->seq_id_data.clear();
     udata->seq_id_data.reserve(n_tokens);
 
     seq_set_t seq_set_unq;

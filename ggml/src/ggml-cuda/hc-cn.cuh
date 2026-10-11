@@ -8,6 +8,8 @@ struct ggml_cuda_hc_combine_norm_args {
     const ggml_tensor * gamma;
     ggml_tensor *       out_res;
     ggml_tensor *       out_xn;     // [n_embd, hc, T]
+    const ggml_tensor * project_w = nullptr;     // optional F32 [n_embd * 4, 4]
+    ggml_tensor *       out_project = nullptr;   // optional F32 [4, T]
     float               s1, b1, s2, b2;
     float               eps;
     uint16_t *          out_xn_bf16 = nullptr;

@@ -126,6 +126,9 @@ private:
 
     llama_batch batch;
 
+    // A preceding graph can still own the other slot. Reuse only unreferenced data.
+    std::vector<std::shared_ptr<llama_ubatch::data_t>> embd_pool;
+
     // only for debugging purposes
     const llama_vocab * vocab;
 

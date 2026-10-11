@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <exception>
 #include <mutex>
+#include <memory>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -32,12 +33,19 @@ struct llama_lazy_reader {
     void gather(const int32_t *, int64_t, float *) const {
         GGML_ABORT("lazy direct reads are not supported on this platform");
     }
+
+    std::shared_ptr<std::vector<float>> acquire_staging(size_t) const {
+        GGML_ABORT("lazy direct reads are not supported on this platform");
+    }
 #else
     llama_lazy_reader(int fd, size_t base, size_t row_size, int64_t n_rows, int n_threads,
                       enum ggml_type type, int64_t head_dim)
         : fd(fd), base(base), row_size(row_size), n_rows(n_rows), n_threads(n_threads),
           head_dim(head_dim), to_float(type == GGML_TYPE_F32 ? nullptr : ggml_get_type_traits(type)->to_float) {
         GGML_ASSERT((type == GGML_TYPE_F32 || to_float != nullptr) && head_dim > 0);
+        const char * e = getenv("LLAMA_LAZY_CACHE_MB");
+        const int mb = e ? atoi(e) : 0;
+        if (mb > 0 && mb <= 256) { cache_limit = (size_t) mb * 1024 * 1024; }
     }
 
     llama_lazy_reader(const llama_lazy_reader &) = delete;
@@ -65,6 +73,24 @@ struct llama_lazy_reader {
     const int64_t  head_dim;
     ggml_to_float_t to_float;  // same dequantizer the ggml_get_rows CPU kernel uses
 
+    std::shared_ptr<std::vector<float>> acquire_staging(size_t count) const {
+        std::lock_guard<std::mutex> lk(staging_mtx);
+        for (auto & buffer : staging_pool) {
+            if (buffer.use_count() == 1) {
+                if (buffer->size() < count) { buffer->resize(count); }
+                return buffer;
+            }
+        }
+        auto buffer = std::make_shared<std::vector<float>>(count);
+        if (staging_pool.size() < 2) { staging_pool.push_back(buffer); }
+        return buffer;
+    }
+
+    size_t cached_row_count() const {
+        std::lock_guard<std::mutex> lk(gather_mtx);
+        return cached_ids.size();
+    }
+
     // fill dst with the n gathered rows, dequantized to F32:
     // dst[slot * head_dim, ...) = to_float(table[rows[slot]])
     // thread-safe; never lets an exception escape a worker thread
@@ -80,6 +106,7 @@ struct llama_lazy_reader {
         }
 
         std::sort(pairs.begin(), pairs.end()); // equal rows adjacent, file order
+        const auto t_sort = std::chrono::steady_clock::now();
 
         // one work item per distinct row: runs[r] .. runs[r + 1] share a row
         std::vector<int64_t> runs;
@@ -91,6 +118,25 @@ struct llama_lazy_reader {
         }
         runs.push_back(n);
         const int64_t n_runs = (int64_t) runs.size() - 1;
+        int64_t cache_hits = 0;
+        cache_write = false;
+        if (cache_limit > 0) {
+            cache_matches.assign(n_runs, -1);
+            size_t previous = 0;
+            for (int64_t r = 0; r < n_runs; ++r) {
+                const int32_t row = pairs[runs[r]].first;
+                while (previous < cached_ids.size() && cached_ids[previous] < row) { ++previous; }
+                if (previous < cached_ids.size() && cached_ids[previous] == row) {
+                    cache_matches[r] = (int32_t) previous;
+                    ++cache_hits;
+                }
+            }
+            cache_write = row_size > 0 && n >= 16384 && n_runs > 0 && (size_t) n_runs <= cache_limit / row_size;
+            if (cache_write && cache_next.size() < (size_t) n_runs * row_size) {
+                cache_next.resize((size_t) n_runs * row_size);
+            }
+        }
+        const auto t_runs = std::chrono::steady_clock::now();
 
         // Each missed row is a random ~100 B read from a multi-GiB table, i.e. one NVMe round trip (~0.1 ms),
         // so even a decode-sized gather (a few tokens x all heads) must keep many reads in flight: a persistent
@@ -99,7 +145,7 @@ struct llama_lazy_reader {
         if (n_threads <= 1 || n_runs <= 2 || force_serial) {
             std::vector<uint8_t> bounce(row_size);
             for (int64_t r = 0; r < n_runs; ++r) {
-                read_run(pairs, runs[r], runs[r + 1], dst, bounce);
+                read_run(pairs, runs[r], runs[r + 1], dst, bounce, r);
             }
         } else {
             if (pool.empty()) {
@@ -131,6 +177,20 @@ struct llama_lazy_reader {
             if (job_err) {
                 std::rethrow_exception(job_err);
             }
+        }
+
+        if (cache_write) {
+            cached_ids.resize(n_runs);
+            for (int64_t r = 0; r < n_runs; ++r) { cached_ids[r] = pairs[runs[r]].first; }
+            cache_data.swap(cache_next);
+        }
+
+        const auto t_end = std::chrono::steady_clock::now();
+        static const bool timing = [] { const char * e = getenv("LLAMA_PLE_TIMING"); return e && atoi(e) != 0; }();
+        if (timing && n >= 16384) {
+            const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+            LLAMA_LOG_WARN("lazy timing rows=%lld uniq=%lld threads=%d cache_hits=%lld: sort %.1f runs %.1f work %.1f total %.1f ms\n",
+                    (long long) n, (long long) n_runs, n_threads, (long long) cache_hits, ms(t0, t_sort), ms(t_sort, t_runs), ms(t_runs, t_end), ms(t0, t_end));
         }
 
         if (stats_on()) {
@@ -175,11 +235,23 @@ struct llama_lazy_reader {
     }
 
 private:
+    size_t cache_limit = 0;
+    mutable std::vector<int32_t> cached_ids;
+    mutable std::vector<int32_t> cache_matches;
+    mutable std::vector<uint8_t> cache_data;
+    mutable std::vector<uint8_t> cache_next;
+    mutable bool cache_write = false;
+
+    mutable std::mutex staging_mtx;
+    mutable std::vector<std::shared_ptr<std::vector<float>>> staging_pool;
+
     // read the row shared by pairs[begin, end), dequantize it once, copy it to every slot that asked for it
     void read_run(const std::vector<std::pair<int32_t, int32_t>> & pairs, int64_t begin, int64_t end, float * dst,
-                  std::vector<uint8_t> & bounce) const {
+                  std::vector<uint8_t> & bounce, int64_t run) const {
         const size_t off = base + (size_t) pairs[begin].first * row_size;
-        for (size_t done = 0; done < row_size; ) {
+        if ((size_t) run < cache_matches.size() && cache_matches[run] >= 0) {
+            memcpy(bounce.data(), cache_data.data() + (size_t) cache_matches[run] * row_size, row_size);
+        } else for (size_t done = 0; done < row_size; ) {
             const ssize_t n_read = ::pread(fd, bounce.data() + done, row_size - done, off + done);
             if (n_read < 0 && errno == EINTR) {
                 continue;
@@ -189,6 +261,9 @@ private:
                         row_size, off, n_read == 0 ? "unexpected EOF" : strerror(errno)));
             }
             done += n_read;
+        }
+        if (cache_write) {
+            memcpy(cache_next.data() + (size_t) run * row_size, bounce.data(), row_size);
         }
         float * first = dst + (size_t) pairs[begin].second * head_dim;
         if (to_float) {
@@ -210,7 +285,7 @@ private:
                 break;
             }
             try {
-                read_run(*job_pairs, runs[r], runs[r + 1], job_dst, bounce);
+                read_run(*job_pairs, runs[r], runs[r + 1], job_dst, bounce, r);
             } catch (...) {
                 std::lock_guard<std::mutex> lk(err_mtx);
                 if (!job_err) {

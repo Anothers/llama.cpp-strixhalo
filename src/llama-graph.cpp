@@ -1365,8 +1365,15 @@ void llm_graph_result::reset() {
 }
 
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
+    static const bool timing = [] { const char * e = getenv("LLAMA_INPUT_TIMING"); return e && atoi(e) != 0; }();
+    size_t index = 0;
     for (auto & input : inputs) {
+        const int64_t begin = timing ? ggml_time_us() : 0;
         input->set_input(ubatch);
+        if (timing && ubatch->n_tokens >= 512) {
+            LLAMA_LOG_WARN("input timing n=%u index=%zu: %.1f ms\n", ubatch->n_tokens, index, (ggml_time_us() - begin)/1e3);
+        }
+        ++index;
     }
 }
 

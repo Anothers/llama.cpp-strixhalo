@@ -1330,6 +1330,11 @@ static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggm
     void * ptr = ggml_cuda_host_malloc(size);
 
     if (ptr == nullptr) {
+        // An integrated GPU can access this buffer directly; ordinary CPU memory is not a valid substitute.
+        if (buft->device && ggml_backend_dev_supports_buft(buft->device, buft)) {
+            GGML_LOG_ERROR("%s: cannot allocate %.2f MiB of GPU-accessible host memory\n", __func__, size / 1024.0 / 1024.0);
+            return nullptr;
+        }
         // fallback to cpu buffer
         return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
     }
@@ -3488,6 +3493,24 @@ static int ggml_cuda_match_hc_combine_norm(
     if (!ggml_cuda_hc_combine_norm_supported(args, warp_size)) {
         return 0;
     }
+    const int norm_end = end;
+    static const bool project = [] {
+        const char * e = getenv("GGML_CUDA_HC_NORM_PROJECT");
+        return e && atoi(e) != 0;
+    }();
+    if (project && hc == 4 && width % 32 == 0 && tokens >= 512 && norm != rms && end + 1 < graph->n_nodes) {
+        ggml_tensor * p = graph->nodes[end + 1];
+        const ggml_tensor * pw = p->src[0];
+        if (p->op == GGML_OP_MUL_MAT && p->src[1] == mulg && pw &&
+                pw->op == GGML_OP_NONE && pw->type == GGML_TYPE_F32 && p->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(pw) && ggml_is_contiguous(p) &&
+                pw->ne[0] == width * hc && pw->ne[1] == 4 && pw->ne[2] == 1 && pw->ne[3] == 1 &&
+                p->ne[0] == 4 && p->ne[1] == tokens && p->ne[2] == 1 && p->ne[3] == 1) {
+            args.project_w = pw;
+            args.out_project = p;
+            ++end;
+        }
+    }
     int indices[16], count = 0;
     ggml_op ops[16];
     for (int k = i; k <= end; ++k) {
@@ -3501,8 +3524,8 @@ static int ggml_cuda_match_hc_combine_norm(
         indices[count] = k;
         ops[count++] = tensor->op;
     }
-    const int outputs[] = {j + 2, end};
-    return ggml_can_fuse_subgraph_ext(graph, indices, count, ops, outputs, 2) ? end - i : 0;
+    const int outputs[] = {j + 2, norm_end, end};
+    return ggml_can_fuse_subgraph_ext(graph, indices, count, ops, outputs, args.out_project ? 3 : 2) ? end - i : 0;
 }
 
 static bool ggml_cuda_hc_combine_norm_alias_ok(const ggml_cuda_hc_combine_norm_args & args) {
@@ -3518,6 +3541,15 @@ static bool ggml_cuda_hc_combine_norm_alias_ok(const ggml_cuda_hc_combine_norm_a
         }
         if (overlap(output, args.residual) && output->data != args.residual->data) {
             return false;
+        }
+    }
+    if (args.out_project) {
+        if (overlap(args.out_res, args.project_w) || overlap(args.out_xn, args.project_w)) {
+            return false;
+        }
+        for (const ggml_tensor * tensor : {args.residual, args.block_out, args.inject, args.gamma,
+                args.project_w, (const ggml_tensor *) args.out_res, (const ggml_tensor *) args.out_xn}) {
+            if (overlap(args.out_project, tensor)) return false;
         }
     }
     return !overlap(args.out_res, args.out_xn);
@@ -5061,6 +5093,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     const ggml_tensor * t = cgraph->nodes[n];
                     if (!reads(t, xn)) continue;
                     ++nread;
+                    if (t == ca.out_project) continue; // fused projection consumes unrounded F32 xn in registers
                     if (t->op == GGML_OP_MUL_MAT && t->src[0]->type != GGML_TYPE_F32 &&
                         ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t)) continue;
                     if (t->op == GGML_OP_MUL && n >= 1) { ggml_cuda_hc_mix_args ma; if (ggml_cuda_hc_mix_closed(cgraph, n - 1, ma) > 0 && (ma.xn == t->src[0] || ma.xn == t->src[1]) && (ma.xn == xn || ma.xn->view_src == xn)) continue; }
@@ -5372,6 +5405,13 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 if (skip > 0) {
                     params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(args.block_out), args.out_xn);
                     params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(args.inject), args.out_xn);
+                    if (args.out_project) {
+                        for (const auto * input : {args.residual, args.block_out, args.inject, args.gamma, args.project_w}) {
+                            params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(input), args.out_project);
+                        }
+                        params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(args.project_w), args.out_res);
+                        params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(args.project_w), args.out_xn);
+                    }
                     i += skip;
                     continue;
                 }

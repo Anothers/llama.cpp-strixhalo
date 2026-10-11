@@ -1607,6 +1607,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         static const bool tdbg = [] { const char * e = getenv("LLAMA_SPEC_TIMING"); return e && atoi(e) != 0; }();
+        static const bool sync_prefill = [] { const char * e = getenv("LLAMA_MTP_PREFILL_SYNC"); return e && atoi(e) != 0; }();
         int64_t t_0 = ggml_time_us(), t_h = 0, t_cp = 0, t_dec = 0;
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
@@ -1671,6 +1672,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (chain_heads) {
                 llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
+            }
+            if (sync_prefill && n_tokens >= 512) {
+                llama_synchronize(ctx_dft);
             }
             t_dec = ggml_time_us();
             if (!ok) {
