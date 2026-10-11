@@ -1206,6 +1206,16 @@ uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
 }
 
+uint32_t llama_kv_cache::seq_stream(llama_seq_id seq_id) const {
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+    return seq_to_stream[seq_id];
+}
+
+void llama_kv_cache::set_n_stream_full(uint32_t n) {
+    GGML_ASSERT(n <= n_stream);
+    n_stream_full = n;
+}
+
 bool llama_kv_cache::get_has_shift() const {
     bool result = false;
 
@@ -2674,7 +2684,7 @@ llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
     n_kv = kv->get_size();
 
-    const uint32_t n_stream = kv->get_n_stream();
+    const uint32_t n_stream = kv->get_n_stream_full();
 
     // create a dummy slot info - the actual data is irrelevant. we just need to build the graph
     sinfos.resize(1);

@@ -593,7 +593,7 @@ void llama_context::sched_reserve(uint32_t n_tokens_hint) {
 
     const int64_t t_start_us = ggml_time_us();
 
-    const uint32_t n_seqs = cparams.n_seq_max;
+    const uint32_t n_seqs = n_seq_reserve();
     const uint32_t n_tokens_max = std::min(cparams.n_ctx, cparams.n_ubatch);
     const uint32_t n_tokens = n_tokens_hint ? std::min(n_tokens_max, n_tokens_hint) : n_tokens_max;
 
@@ -782,6 +782,11 @@ uint32_t llama_context::n_seq_max() const {
     return cparams.n_seq_max;
 }
 
+uint32_t llama_context::n_seq_reserve() const {
+    const uint32_t n_seq_ubatch = memory ? memory->get_n_seq_ubatch() : 0;
+    return n_seq_ubatch > 0 ? std::min(cparams.n_seq_max, n_seq_ubatch) : cparams.n_seq_max;
+}
+
 uint32_t llama_context::n_threads() const {
     return cparams.n_threads;
 }
@@ -836,7 +841,7 @@ bool llama_context::memory_update(bool optimize) {
             throw std::runtime_error("failed to initialize memory context");
         }
 
-        const uint32_t n_seqs = cparams.n_seq_max;
+        const uint32_t n_seqs = n_seq_reserve();
         const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
         const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);

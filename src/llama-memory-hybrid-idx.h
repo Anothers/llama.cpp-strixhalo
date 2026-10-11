@@ -65,6 +65,8 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
+    uint32_t get_n_seq_ubatch() const override { return n_seq_ubatch; }
+
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
@@ -91,21 +93,31 @@ public:
                              ggml_tensor * bias, ggml_tensor * tail_idxs,
                              const llama_ubatch * ubatch, uint32_t ratio) const;
 
+    // the incremental QSA state is kept per indexer stream: a stream holds one sequence when the cache is not unified
     void qsa_apply(const llama_ubatch & ubatch, const llama_kv_cache::slot_info & slots);
     void qsa_invalidate();
     bool qsa_prefix_matches(const llama_ubatch & ubatch) const;
     bool qsa_fast(int il, const llama_ubatch & ubatch) const;
-    ggml_tensor * qsa_cache(ggml_context * ctx, int il, int64_t blocks) const;
-    void qsa_fill_updates(ggml_tensor * members, ggml_tensor * positions, ggml_tensor * rows) const;
-    void qsa_commit(int il) const;
+    ggml_tensor * qsa_cache(ggml_context * ctx, int il, int64_t blocks, uint32_t stream) const;
+    void qsa_fill_updates(ggml_tensor * members, ggml_tensor * positions, ggml_tensor * rows, uint32_t stream) const;
+    void qsa_commit(int il, uint32_t stream) const;
 
 private:
+    // 1 when a non-unified cache keeps every ubatch to one sequence (LLAMA_UBATCH_PER_SEQ=0 allows mixing):
+    // a single-stream ubatch keeps the block-selection, maskless and incremental QSA paths, which need one stream
+    uint32_t n_seq_ubatch = 0;
+
     bool incremental_qsa = false;
-    bool qsa_recover_pending = false;
+    struct qsa_stream_state {
+        qsa_prefix_state prefix;
+        bool recover_pending = false;
+        mutable std::vector<int64_t> ready;   // per layer
+        std::vector<ggml_tensor *> keys;      // per layer
+    };
+    std::vector<qsa_stream_state> qsa;        // per indexer stream
+    uint32_t qsa_stream_of(llama_seq_id seq) const;
+    void qsa_invalidate_seq(llama_seq_id seq);   // seq < 0: every stream
     bool qsa_recover(llama_seq_id seq);
-    qsa_prefix_state qsa_prefix;
-    mutable std::vector<int64_t> qsa_ready;
-    std::vector<ggml_tensor *> qsa_keys;
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> qsa_buffers;
     bool qsa_metadata(ggml_tensor * cells, ggml_tensor * positions, ggml_tensor * bias,
                       ggml_tensor * tails, const llama_ubatch & ubatch, uint32_t ratio) const;
@@ -169,10 +181,12 @@ public:
     // has blocks past that view. Never below get_n_kv(), padded like it so graph reuse keeps its cadence.
     uint32_t qsa_n_kv_window() const;
     ggml_tensor * qsa_cache(ggml_context * ctx, int il) const {
-        return mem ? mem->qsa_cache(ctx, il, (qsa_n_kv_window()+3)/4) : nullptr;
+        return mem ? mem->qsa_cache(ctx, il, (qsa_n_kv_window()+3)/4, qsa_stream()) : nullptr;
     }
-    void qsa_fill_updates(ggml_tensor * c, ggml_tensor * p, ggml_tensor * r) const { mem->qsa_fill_updates(c,p,r); }
-    void qsa_commit(int il) const { mem->qsa_commit(il); }
+    void qsa_fill_updates(ggml_tensor * c, ggml_tensor * p, ggml_tensor * r) const { mem->qsa_fill_updates(c,p,r,qsa_stream()); }
+    void qsa_commit(int il) const { mem->qsa_commit(il, qsa_stream()); }
+    // indexer stream of the current ubatch; 0 for a full-cache context
+    uint32_t qsa_stream() const;
 
 
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified

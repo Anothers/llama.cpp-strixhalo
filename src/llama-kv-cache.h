@@ -158,6 +158,14 @@ public:
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
 
+    // stream holding seq_id (0 when unified)
+    uint32_t seq_stream(llama_seq_id seq_id) const;
+
+    // streams a full-cache (graph reservation) context spans; a memory that never mixes sequences in one
+    // ubatch sets 1, so the worst-case graph has the shape of a real ubatch instead of every stream at once
+    void set_n_stream_full(uint32_t n);
+    uint32_t get_n_stream_full() const { return n_stream_full > 0 ? n_stream_full : n_stream; }
+
     bool get_has_shift() const;
 
     ggml_type type_k() const;
@@ -304,6 +312,8 @@ private:
 
     // maps from a sequence id to a stream id
     std::vector<uint32_t> seq_to_stream;
+
+    uint32_t n_stream_full = 0;   // 0 = all streams
 
     // pending stream copies that will be applied during the next update
     stream_copy_info sc_info;

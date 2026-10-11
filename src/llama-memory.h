@@ -118,6 +118,9 @@ struct llama_memory_i {
 
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
 
+    // most sequences one ubatch can carry (0 = no limit); graph reservation sizes its worst case with this
+    virtual uint32_t get_n_seq_ubatch() const { return 0; }
+
     //
     // state write/read
     //
