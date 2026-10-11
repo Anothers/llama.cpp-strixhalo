@@ -1391,8 +1391,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 // thread spent ~18 ms per copy while the GPU sat idle between the target ubatch and the draft decode
 // set by the caller around common_speculative_process for prompt batches far from the prompt end: the MTP head only
 // writes its K/V for them (see llama_set_mtp_kv_only)
-static bool g_spec_prefill_kv_only = false;
-void common_speculative_set_prefill_kv_only(bool value) { g_spec_prefill_kv_only = value; }
+static int32_t g_spec_prefill_kv_prefix = 0;
+void common_speculative_set_prefill_kv_only(bool value) { g_spec_prefill_kv_prefix = value ? INT32_MAX : 0; }
+void common_speculative_set_prefill_kv_prefix(int32_t n_tokens) { g_spec_prefill_kv_prefix = std::max(0, n_tokens); }
 
 static void spec_par_memcpy(void * dst, const void * src, size_t n) {
     constexpr size_t min_split = 8u << 20;
@@ -1658,10 +1659,31 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
-                const bool kv_only = g_spec_prefill_kv_only && !chain_heads;
-                if (kv_only) { llama_set_mtp_kv_only(ctx_dft, true); }
-                const int32_t rc = llama_decode(ctx_dft, batch);
-                if (kv_only) { llama_set_mtp_kv_only(ctx_dft, false); }
+                // a K/V-only prefix writes exactly the caches the full head would (single-layer head, no outputs
+                // requested here), so only the tail of the prompt needs the full pass; splitting inside the batch
+                // also caps the full-head graph, the largest draft compute buffer, at the tail length
+                const int32_t kv_prefix = chain_heads ? 0 : std::min(g_spec_prefill_kv_prefix, batch.n_tokens);
+                auto decode_part = [&](int32_t i0, int32_t i1, bool kv_only) {
+                    llama_batch part = batch;
+                    part.n_tokens = i1 - i0;
+                    part.token    += i0;
+                    part.embd     += (size_t) i0 * n_embd;
+                    part.pos      += i0;
+                    part.n_seq_id += i0;
+                    part.seq_id   += i0;
+                    part.logits   += i0;
+                    if (kv_only) { llama_set_mtp_kv_only(ctx_dft, true); }
+                    const int32_t r = llama_decode(ctx_dft, part);
+                    if (kv_only) { llama_set_mtp_kv_only(ctx_dft, false); }
+                    return r;
+                };
+                int32_t rc = 0;
+                if (kv_prefix > 0) {
+                    rc = decode_part(0, kv_prefix, true);
+                }
+                if (rc == 0 && kv_prefix < batch.n_tokens) {
+                    rc = decode_part(kv_prefix, batch.n_tokens, false);
+                }
                 if (rc != 0) {
                     SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) batch_in.pos[0]);

@@ -3829,16 +3829,31 @@ private:
         // LLAMA_MTP_PREFILL_TAIL=N: a prompt ubatch that ends more than N tokens before the end of its prompt skips the
         // draft head's catch-up decode (the draft attends only to the last N prompt tokens; drafts are always verified)
         static const int mtp_tail = [] { const char * e = getenv("LLAMA_MTP_PREFILL_TAIL"); return e ? atoi(e) : 0; }();
+        // LLAMA_MTP_PREFILL_TAIL_TOKENS=1 (default): decided per token, so a batch straddling the tail runs its leading
+        // tokens K/V-only and only the last mtp_tail tokens through the full head; 0 decides per batch
+        static const bool mtp_tail_tokens = [] { const char * e = getenv("LLAMA_MTP_PREFILL_TAIL_TOKENS"); return !e || atoi(e) != 0; }();
         bool skip_draft = false;
+        int32_t kv_prefix = 0;
         if (spec && mtp_tail > 0 && batch_view.n_tokens > 16) {
+            const int32_t n = batch_view.n_tokens;
             const llama_seq_id s0 = batch_view.seq_id[0][0];
             bool single = true;
-            for (int k = 1; k < batch_view.n_tokens && single; ++k) { single = batch_view.seq_id[k][0] == s0; }
+            bool contiguous = true;
+            for (int k = 1; k < n && single; ++k) {
+                single      = batch_view.seq_id[k][0] == s0;
+                contiguous &= batch_view.pos[k] == batch_view.pos[k - 1] + 1;
+            }
             if (single) {
                 for (auto & slot : slots) {
                     if (slot.id == s0 && slot.task) {
                         const int64_t total = slot.task->n_tokens();
-                        skip_draft = (int64_t) batch_view.pos[batch_view.n_tokens - 1] + mtp_tail < total;
+                        skip_draft = (int64_t) batch_view.pos[n - 1] + mtp_tail < total;
+                        if (skip_draft) {
+                            kv_prefix = n;
+                        } else if (mtp_tail_tokens && contiguous) {
+                            // positions below total - mtp_tail are far from the prompt end
+                            kv_prefix = (int32_t) std::clamp<int64_t>(total - mtp_tail - (int64_t) batch_view.pos[0], 0, n);
+                        }
                     }
                 }
             }
@@ -3848,7 +3863,7 @@ private:
         static const bool mtp_kv_only = [] { const char * e = getenv("LLAMA_MTP_PREFILL_KV_ONLY"); return !e || atoi(e) != 0; }();
         if (spec && (!skip_draft || mtp_kv_only)) {
             bool ok = true;
-            common_speculative_set_prefill_kv_only(skip_draft);
+            common_speculative_set_prefill_kv_prefix(mtp_kv_only ? kv_prefix : 0);
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch_view);
             });

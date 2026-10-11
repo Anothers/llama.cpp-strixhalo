@@ -123,3 +123,5 @@ common_speculative_init_result_ptr common_speculative_init_from_params(common_pa
 
 // MTP: the next common_speculative_process calls only write the draft head's K/V (prompt far from its end)
 void common_speculative_set_prefill_kv_only(bool value);
+// the first n tokens of the next prompt batch run the MTP head K/V-only, the rest the full head (n >= batch: all K/V-only)
+void common_speculative_set_prefill_kv_prefix(int32_t n_tokens);
