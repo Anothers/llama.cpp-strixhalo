@@ -129,6 +129,12 @@ struct ggml_dyn_tallocr {
         const struct ggml_tensor * tensor;
         struct buffer_address addr;
     } allocated_tensors[1024];
+    // live set at the moment the high-water mark of any chunk last grew
+    struct {
+        const struct ggml_tensor * tensor;
+        struct buffer_address addr;
+    } peak_tensors[1024];
+    size_t peak_size;
 #endif
 };
 
@@ -273,31 +279,9 @@ static struct buffer_address ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * al
 #ifdef GGML_ALLOCATOR_DEBUG
     add_allocated_tensor(alloc, addr, tensor);
     size_t cur_max = addr.offset + size;
-    if (cur_max > chunk->max_size) {
-        // sort allocated_tensors by chunk/offset
-        for (int i = 0; i < 1024; i++) {
-            for (int j = i + 1; j < 1024; j++) {
-                if (ggml_buffer_address_less(alloc->allocated_tensors[j].addr, alloc->allocated_tensors[i].addr)) {
-                    const struct ggml_tensor * tmp_tensor = alloc->allocated_tensors[i].tensor;
-                    struct buffer_address tmp_addr = alloc->allocated_tensors[i].addr;
-                    alloc->allocated_tensors[i].tensor = alloc->allocated_tensors[j].tensor;
-                    alloc->allocated_tensors[i].addr = alloc->allocated_tensors[j].addr;
-                    alloc->allocated_tensors[j].tensor = tmp_tensor;
-                    alloc->allocated_tensors[j].addr = tmp_addr;
-                }
-            }
-        }
-        GGML_LOG_DEBUG("max_size[%d] = %.2f MB: tensors: ", addr.chunk, cur_max / 1024.0 / 1024.0);
-        for (int i = 0; i < 1024; i++) {
-            if (alloc->allocated_tensors[i].tensor) {
-                GGML_LOG_DEBUG("%s [%d: %zx-%zx] (%.2f MB) ", alloc->allocated_tensors[i].tensor->name,
-                    alloc->allocated_tensors[i].addr.chunk,
-                    alloc->allocated_tensors[i].addr.offset,
-                    alloc->allocated_tensors[i].addr.offset + ggml_nbytes(alloc->allocated_tensors[i].tensor),
-                    ggml_nbytes(alloc->allocated_tensors[i].tensor) / 1024.0 / 1024.0);
-            }
-        }
-        GGML_LOG_DEBUG("\n");
+    if (cur_max > chunk->max_size && cur_max > alloc->peak_size) {
+        memcpy(alloc->peak_tensors, alloc->allocated_tensors, sizeof(alloc->peak_tensors));
+        alloc->peak_size = cur_max;
     }
 #endif
 
@@ -350,6 +334,9 @@ static void ggml_dyn_tallocr_free_bytes(struct ggml_dyn_tallocr * alloc, struct 
 }
 
 static void ggml_dyn_tallocr_reset(struct ggml_dyn_tallocr * alloc) {
+#ifdef GGML_ALLOCATOR_DEBUG
+    alloc->peak_size = 0;
+#endif
     for (int i = 0; i < GGML_VBUFFER_MAX_CHUNKS; i++) {
         free(alloc->chunks[i]);
         alloc->chunks[i] = NULL;
@@ -867,6 +854,49 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
     }
 }
 
+#ifdef GGML_ALLOCATOR_DEBUG
+static int ggml_peak_cmp(const void * a, const void * b) {
+    const struct ggml_tensor * ta = *(const struct ggml_tensor * const *) a;
+    const struct ggml_tensor * tb = *(const struct ggml_tensor * const *) b;
+    const size_t sa = ggml_nbytes(ta), sb = ggml_nbytes(tb);
+    return sa < sb ? 1 : sa > sb ? -1 : 0;
+}
+
+// GGML_ALLOC_PEAK_DUMP=N: for every buffer whose peak is >= 64 MiB, print the N largest tensors live at the peak
+static void ggml_gallocr_dump_peak(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+    const char * e = getenv("GGML_ALLOC_PEAK_DUMP");
+    const int top = e ? atoi(e) : 0;
+    if (top <= 0) {
+        return;
+    }
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        bool seen = false;
+        for (int j = 0; j < i; j++) { seen |= galloc->buf_tallocs[j] == galloc->buf_tallocs[i]; }
+        struct ggml_dyn_tallocr * alloc = galloc->buf_tallocs[i];
+        if (seen || alloc->peak_size < (64u << 20)) {
+            continue;
+        }
+        const struct ggml_tensor * live[1024];
+        int n = 0;
+        size_t sum = 0;
+        for (int k = 0; k < 1024; k++) {
+            if (alloc->peak_tensors[k].tensor) {
+                live[n++] = alloc->peak_tensors[k].tensor;
+                sum += ggml_nbytes(alloc->peak_tensors[k].tensor);
+            }
+        }
+        qsort(live, n, sizeof(live[0]), ggml_peak_cmp);
+        GGML_LOG_WARN("ALLOC_PEAK buft=%s graph_nodes=%d peak=%.1f MiB live=%d live_sum=%.1f MiB\n",
+            ggml_backend_buft_name(galloc->bufts[i]), graph->n_nodes, alloc->peak_size / 1048576.0, n, sum / 1048576.0);
+        for (int k = 0; k < n && k < top; k++) {
+            const struct ggml_tensor * t = live[k];
+            GGML_LOG_WARN("ALLOC_PEAK   %9.1f MiB %-40s %-14s %-5s [%lld,%lld,%lld,%lld]\n", ggml_nbytes(t) / 1048576.0, t->name,
+                ggml_op_desc(t), ggml_type_name(t->type), (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3]);
+        }
+    }
+}
+#endif
+
 static bool ggml_gallocr_reserve_n_impl(
         ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc) {
     size_t min_hash_size = graph->n_nodes + graph->n_leafs;
@@ -891,6 +921,9 @@ static bool ggml_gallocr_reserve_n_impl(
 
     // allocate in hash table
     ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
+#ifdef GGML_ALLOCATOR_DEBUG
+    ggml_gallocr_dump_peak(galloc, graph);
+#endif
 
     // set the node_allocs from the hash table
     if (galloc->n_nodes < graph->n_nodes) {

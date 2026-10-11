@@ -2327,7 +2327,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     if (!weight_before_ffn) {
-        experts = ggml_mul(ctx0, experts, weights);
+        // In place: backends that fuse the weighted expert sum never materialize this product, and a separate
+        // [n_embd, n_expert_used, n_tokens] buffer would stay reserved next to ffn_moe_down for nothing.
+        // LLAMA_MOE_WEIGHTED_INPLACE=0 restores the out-of-place product.
+        static const bool weighted_inplace = [] { const char * e = getenv("LLAMA_MOE_WEIGHTED_INPLACE"); return !e || atoi(e) != 0; }();
+        experts = weighted_inplace ? ggml_mul_inplace(ctx0, experts, weights) : ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);
     }
 

@@ -3271,6 +3271,9 @@ static bool ggml_cuda_match_moe_weighted_reduction(
     if (mul_count == 2) {
         ops[1] = GGML_OP_MUL;
     }
+    // an in-place product is itself a view, and views of it point at its root
+    const ggml_tensor * weighted_root = weighted->view_src ? weighted->view_src : weighted;
+    const size_t        weighted_offs = weighted->view_src ? weighted->view_offs : 0;
     std::vector<const ggml_tensor *> views;
     views.reserve(n_expert_used);
     const ggml_tensor * previous = nullptr;
@@ -3281,11 +3284,11 @@ static bool ggml_cuda_match_moe_weighted_reduction(
 
         if (candidate->op == GGML_OP_VIEW) {
             const int expert = (int) views.size();
-            if (expert >= n_expert_used || candidate->src[0] != weighted || candidate->view_src != weighted ||
+            if (expert >= n_expert_used || candidate->src[0] != weighted || candidate->view_src != weighted_root ||
                     candidate->type != GGML_TYPE_F32 || candidate->ne[0] != weighted->ne[0] ||
                     candidate->ne[1] != n_tokens || candidate->ne[2] != 1 || candidate->ne[3] != 1 ||
                     candidate->nb[0] != weighted->nb[0] || candidate->nb[1] != weighted->nb[2] ||
-                    candidate->view_offs != (size_t) expert * weighted->nb[1]) {
+                    candidate->view_offs != weighted_offs + (size_t) expert * weighted->nb[1]) {
                 return false;
             }
             views.push_back(candidate);
