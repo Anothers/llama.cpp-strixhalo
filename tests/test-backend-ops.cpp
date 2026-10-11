@@ -7224,16 +7224,19 @@ struct test_moe_weighted_reduction : public test_case {
     const bool unaligned_experts;
     const bool with_expert_scale;
     const bool interleaved_views_adds;
+    const bool inplace_weighted; // experts produced by a graph node, weighted in place (llama-graph default)
 
     test_moe_weighted_reduction(
             int64_t n_embd, int64_t n_expert_used, int64_t n_tokens,
-            bool unaligned_experts = false, bool with_expert_scale = false, bool interleaved_views_adds = false) :
+            bool unaligned_experts = false, bool with_expert_scale = false, bool interleaved_views_adds = false,
+            bool inplace_weighted = false) :
         n_embd(n_embd), n_expert_used(n_expert_used), n_tokens(n_tokens),
         unaligned_experts(unaligned_experts), with_expert_scale(with_expert_scale),
-        interleaved_views_adds(interleaved_views_adds) {}
+        interleaved_views_adds(interleaved_views_adds), inplace_weighted(inplace_weighted) {}
 
     std::string vars() override {
-        return VARS_TO_STR6(n_embd, n_expert_used, n_tokens, unaligned_experts, with_expert_scale, interleaved_views_adds);
+        return VARS_TO_STR7(n_embd, n_expert_used, n_tokens, unaligned_experts, with_expert_scale, interleaved_views_adds,
+            inplace_weighted);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -7255,6 +7258,10 @@ struct test_moe_weighted_reduction : public test_case {
             experts = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_expert_used, n_tokens);
         }
         ggml_set_name(experts, "experts");
+        if (inplace_weighted) {
+            experts = ggml_scale(ctx, experts, 1.0f);
+            ggml_set_name(experts, "experts_node");
+        }
         ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_expert_used, n_tokens);
         ggml_set_name(weights, "weights");
 
@@ -7266,7 +7273,7 @@ struct test_moe_weighted_reduction : public test_case {
             ggml_set_name(scaled, "scaled_experts");
         }
 
-        ggml_tensor * weighted = ggml_mul(ctx, scaled, weights);
+        ggml_tensor * weighted = inplace_weighted ? ggml_mul_inplace(ctx, scaled, weights) : ggml_mul(ctx, scaled, weights);
         ggml_set_name(weighted, "weighted_experts");
 
         std::vector<ggml_tensor *> views(n_expert_used);
@@ -11487,6 +11494,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_weighted_reduction(63,  2, 17));
     test_cases.emplace_back(new test_moe_weighted_reduction(2048, 8, 128));
     test_cases.emplace_back(new test_moe_weighted_reduction(2048, 8, 128, false, true));
+    test_cases.emplace_back(new test_moe_weighted_reduction(2048, 8, 128, false, false, false, true));
+    test_cases.emplace_back(new test_moe_weighted_reduction(2048, 8, 128, false, true, false, true));
+    test_cases.emplace_back(new test_moe_weighted_reduction(2560, 10, 512, false, false, false, false));
+    test_cases.emplace_back(new test_moe_weighted_reduction(2560, 10, 512, false, false, false, true));
     test_cases.emplace_back(new test_moe_weighted_reduction(63,   12, 33, true,  true, true));
     test_cases.emplace_back(new test_moe_weighted_reduction(2048, 15, 40, false, true));
     test_cases.emplace_back(new test_moe_weighted_reduction(2048, 16, 32, false, true));
@@ -11604,6 +11615,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // fused weighted expert sum, out-of-place vs in-place product (both should hit the fused kernel)
+    test_cases.emplace_back(new test_moe_weighted_reduction(2560, 10, 4096, false, false, false, false));
+    test_cases.emplace_back(new test_moe_weighted_reduction(2560, 10, 4096, false, false, false, true));
 
     // qwen4exp (Qwen3.8-Flash-Next UD-Q4_K_XL) prefill matmuls at an 8192-token ubatch; filter with -p 'qwen4exp' is not
     // possible (vars only), so select with -o MUL_MAT / MUL_MAT_ID and -p on the shape, e.g. -p 'k=10240'

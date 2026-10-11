@@ -3316,8 +3316,39 @@ static bool ggml_cuda_match_moe_weighted_reduction(
     }
 
     const int output_idx = node_idx + node_count - 1;
-    if (!ggml_can_fuse_subgraph(cgraph, node_idx, node_count, ops.data(), &output_idx, 1)) {
-        return false;
+    bool root_inside = weighted_root == weighted;
+    for (int k = node_idx; k < node_idx + node_count && !root_inside; ++k) {
+        root_inside = cgraph->nodes[k] == weighted_root;
+    }
+    if (root_inside) {
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, node_count, ops.data(), &output_idx, 1)) {
+            return false;
+        }
+    } else {
+        // In-place product: it and every expert view alias the producer of the experts (or of the scaled experts),
+        // which lies before the matched range. The fused kernel only reads it, so it joins the checked set as an
+        // intermediate: its only use must be the product, and the views' source is then inside the set.
+        int root_idx = -1;
+        for (int k = node_idx - 1; k >= 0; --k) {
+            if (cgraph->nodes[k] == weighted_root) {
+                root_idx = k;
+                break;
+            }
+        }
+        if (root_idx < 0 || node_count + 1 > 32) {
+            return false;
+        }
+        int     idxs[32];
+        ggml_op all_ops[32];
+        idxs[0]    = root_idx;
+        all_ops[0] = weighted_root->op;
+        for (int k = 0; k < node_count; ++k) {
+            idxs[k + 1]    = node_idx + k;
+            all_ops[k + 1] = ops[k];
+        }
+        if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, node_count + 1, all_ops, &output_idx, 1)) {
+            return false;
+        }
     }
 
     match.experts      = experts;
