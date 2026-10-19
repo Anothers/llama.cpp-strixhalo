@@ -3744,6 +3744,11 @@ private:
             has_output |= batch.tokens[i].output;
         }
 
+        // prompt processing grows the compute buffers with the context; give them the cached prompts' RAM first
+        if (prompt_cache && batch_view.n_tokens >= 64) {
+            prompt_cache->ensure_headroom(0);
+        }
+
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;

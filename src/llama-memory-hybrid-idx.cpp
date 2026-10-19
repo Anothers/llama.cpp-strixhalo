@@ -15,6 +15,7 @@
 #include <cassert>
 #include <cmath>
 #include <iterator>
+#include <limits>
 #include <stdexcept>
 
 //
@@ -122,8 +123,62 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     }
 }
 
+// A sequence holding image (2D) cells fails qsa_scalar_visibility, so QSA falls back to dense per-cell masks and
+// biases of n_kv x n_ubatch, kept both in ROCm_Host and in device memory. At 205K with a 16K ubatch that is ~20 GB
+// and took the whole UMA host down (2026-10-12). Cap the ubatch so those buffers stay within a fixed budget.
+static uint32_t hybrid_idx_dense_ubatch_cap(const llama_kv_cache * kv, const llama_batch & batch, uint32_t n_ubatch) {
+    static const size_t budget = [] {
+        const char * e = getenv("LLAMA_DENSE_UBATCH_BUDGET_MIB");
+        return 1024ull*1024ull*(size_t) (e ? std::max(0, atoi(e)) : 3072);
+    }();
+    // ~8 bytes per (cell, token): F32 bias + F16 mask, host and device copies are counted against the budget separately
+    constexpr size_t bytes_per_elem = 8;
+
+    if (budget == 0 || kv == nullptr || batch.n_tokens < 512 || batch.seq_id == nullptr) {
+        return n_ubatch;
+    }
+
+    const llama_seq_id seq = batch.seq_id[0][0];
+    const auto & cells = kv->get_cells(seq);
+
+    // same rule as qsa_scalar_visibility: only image cells at a pos this batch queries force the dense fallback
+    static const bool image_scalar = [] { const char * e = getenv("LLAMA_QSA_IMAGE_SCALAR"); return !e || atoi(e) != 0; }();
+    llama_pos q_min = 0, q_max = std::numeric_limits<llama_pos>::max();
+    if (image_scalar && batch.pos != nullptr) {
+        q_min = q_max = batch.pos[0];
+        for (int32_t i = 1; i < batch.n_tokens; ++i) {
+            q_min = std::min(q_min, batch.pos[i]);
+            q_max = std::max(q_max, batch.pos[i]);
+        }
+    }
+
+    bool has_2d = false;
+    for (uint32_t j = 0; j < cells.used_max_p1() && !has_2d; ++j) {
+        if (cells.is_empty(j) || !cells.seq_has(j, seq)) {
+            continue;
+        }
+        const llama_pos p = cells.pos_get(j);
+        has_2d = cells.ext_get(j).is_2d_gt(p, p) && p >= q_min && p <= q_max;
+    }
+    if (!has_2d) {
+        return n_ubatch;
+    }
+
+    const size_t n_kv = (size_t) std::max<llama_pos>(0, cells.seq_pos_max(seq)) + 1 + batch.n_tokens;
+    const uint32_t cap = std::max<uint32_t>(256, (uint32_t) (budget / (bytes_per_elem * n_kv)) / 256 * 256);
+    if (cap >= n_ubatch) {
+        return n_ubatch;
+    }
+
+    LLAMA_LOG_WARN("%s: image cells in seq %d, dense QSA fallback at n_kv ~%zu: n_ubatch %u -> %u\n",
+            __func__, seq, n_kv, n_ubatch, cap);
+    return cap;
+}
+
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
+    n_ubatch = hybrid_idx_dense_ubatch_cap(mem_idx ? mem_idx.get() : get_mem_attn(), balloc.get_batch(), n_ubatch);
+
     do {
         balloc.split_reset();
 
@@ -902,9 +957,19 @@ bool llama_memory_hybrid_idx_context::qsa_scalar_visibility(const llama_ubatch &
     // repeats this check against its own sequence when its graph is built.
     const bool reserving = mem->get_mem_idx()->get_n_stream() > 1 && i_cur >= qsa_slots.size();
     if (ubatch.is_pos_2d() && !reserving) {
+        // the mrope mask only consults ext (y, x) when key and query share pos, so an image cell breaks scalar
+        // visibility only for queries at its own pos. Text after an image has a larger pos and stays scalar;
+        // set_input_qsa_impl ranks the duplicate image positions in mask order. LLAMA_QSA_IMAGE_SCALAR=0 restores
+        // the old rule (any image cell -> dense), which costs n_kv x n_ubatch masks and ~3x slower prefill.
+        static const bool image_scalar = [] { const char * e = getenv("LLAMA_QSA_IMAGE_SCALAR"); return !e || atoi(e) != 0; }();
+        llama_pos q_min = ubatch.pos[0], q_max = ubatch.pos[0];
+        for (uint32_t i=1;i<ubatch.n_tokens;++i) { q_min=std::min(q_min,ubatch.pos[i]); q_max=std::max(q_max,ubatch.pos[i]); }
         const auto & cells=mem->get_mem_idx()->get_cells(seq);
         for (uint32_t j=0;j<get_idx()->get_n_kv();++j) {
-            if (!cells.is_empty(j) && cells.seq_has(j,seq) && cells.ext_get(j).is_2d_gt(cells.pos_get(j),cells.pos_get(j))) { return false; }
+            if (cells.is_empty(j) || !cells.seq_has(j,seq)) { continue; }
+            const llama_pos p=cells.pos_get(j);
+            if (!cells.ext_get(j).is_2d_gt(p,p)) { continue; }
+            if (!image_scalar || (p>=q_min && p<=q_max)) { return false; }
         }
     }
     return true;

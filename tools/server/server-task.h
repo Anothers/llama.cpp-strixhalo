@@ -613,6 +613,9 @@ struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
+
+        const char * e = getenv("LLAMA_CACHE_RAM_RESERVE_MIB");
+        this->reserve_mem  = 1024ull*1024ull*(e ? std::max(0, atoi(e)) : 10240);
     }
 
     std::list<server_prompt_cache_state> states;
@@ -622,6 +625,14 @@ struct server_prompt_cache {
 
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
+
+    // keep at least this much system MemAvailable, in bytes (LLAMA_CACHE_RAM_RESERVE_MIB, default 10240, 0 = off)
+    // on UMA devices the GPU compute buffers grow with the context and come from the same RAM, and Linux
+    // overcommit means bad_alloc never fires - touching the pages invokes the OOM killer instead
+    size_t reserve_mem = 0;
+
+    // evict the oldest entries until MemAvailable >= reserve_mem + extra; false if that is still not met
+    bool ensure_headroom(size_t extra);
 
     size_t size() const;
 

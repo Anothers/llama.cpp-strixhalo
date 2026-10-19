@@ -1757,6 +1757,13 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
+    // the resize below cannot fail on Linux (overcommit), so check the real system headroom first
+    if (!ensure_headroom(state_size_new)) {
+        SRV_WRN(" - not enough free system memory for prompt state of %.3f MiB, skipping\n",
+                state_size_new / (1024.0 * 1024.0));
+        return nullptr;
+    }
+
     std::vector<uint8_t> state_data_tgt;
     std::vector<uint8_t> state_data_dft;
 
@@ -1865,6 +1872,44 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     }
 
     return true;
+}
+
+// MemAvailable from /proc/meminfo in bytes, SIZE_MAX if unknown
+static size_t mem_available_bytes() {
+    FILE * f = fopen("/proc/meminfo", "r");
+    if (!f) {
+        return SIZE_MAX;
+    }
+    char line[256];
+    size_t res = SIZE_MAX;
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long long kb = 0;
+        if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+            res = (size_t) kb * 1024;
+            break;
+        }
+    }
+    fclose(f);
+    return res;
+}
+
+bool server_prompt_cache::ensure_headroom(size_t extra) {
+    if (reserve_mem == 0) {
+        return true;
+    }
+
+    const size_t need = reserve_mem + extra;
+
+    size_t avail = mem_available_bytes();
+    while (avail < need && !states.empty()) {
+        SRV_WRN(" - low system memory (available %.3f MiB, need %.3f MiB), removing oldest cache entry (size = %.3f MiB)\n",
+                avail / (1024.0 * 1024.0), need / (1024.0 * 1024.0), states.front().size() / (1024.0 * 1024.0));
+
+        states.pop_front();
+        avail = mem_available_bytes();
+    }
+
+    return avail >= need;
 }
 
 void server_prompt_cache::update() {
