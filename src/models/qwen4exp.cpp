@@ -315,6 +315,14 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
         layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", il), { n_embd, n_vocab }, flags | TENSOR_NOT_REQUIRED);
         layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_vocab }, flags | TENSOR_NOT_REQUIRED);
+
+        // optional draft-only head over a vocabulary subset: drafts are only ever proposals, so a smaller head
+        // trades a little acceptance for a much cheaper draft step; the logits are scattered back to n_vocab
+        if (const ggml_tensor * meta = ml.get_tensor_meta(tn(LLM_TENSOR_NEXTN_DRAFT_VOCAB, "weight", il).str().c_str())) {
+            const int64_t n_sub = meta->ne[0];
+            layer.nextn.draft_vocab = create_tensor(tn(LLM_TENSOR_NEXTN_DRAFT_VOCAB, "weight", il), { n_sub }, flags);
+            layer.nextn.draft_head  = create_tensor(tn(LLM_TENSOR_NEXTN_DRAFT_HEAD,  "weight", il), { n_embd, n_sub }, flags);
+        }
     }
 }
 
@@ -828,7 +836,20 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         GGML_ASSERT(head_w && "QWEN4EXP MTP: the target model has no LM head to borrow");
     }
 
-    cur = build_lora_mm(head_w, cur, head_s);
+    static const bool use_draft_vocab = [] { const char * e = getenv("LLAMA_MTP_DRAFT_VOCAB"); return !e || atoi(e) != 0; }();
+    if (layer.nextn.draft_head && use_draft_vocab) {
+        // logits over the subset, scattered into rows of a -inf [n_vocab] column per token: downstream
+        // sampling, top-k and the rejection test see a full-vocabulary distribution with zero mass elsewhere
+        const int64_t n_tok = cur->ne[1];
+        ggml_tensor * sub = ggml_mul_mat(ctx0, layer.nextn.draft_head, cur);        // [n_sub, n_tok]
+        cb(sub, "mtp_draft_sub_logits", -1);
+        ggml_tensor * full = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_tok, head_w->ne[1]), -INFINITY);
+        ggml_tensor * subT = n_tok == 1 ? ggml_reshape_2d(ctx0, sub, 1, sub->ne[0]) : ggml_cont(ctx0, ggml_transpose(ctx0, sub));
+        full = ggml_set_rows(ctx0, full, subT, layer.nextn.draft_vocab);              // [n_tok, n_vocab]
+        cur  = n_tok == 1 ? ggml_reshape_2d(ctx0, full, head_w->ne[1], 1) : ggml_cont(ctx0, ggml_transpose(ctx0, full));
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 

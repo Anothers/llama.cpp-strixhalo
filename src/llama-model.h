@@ -231,6 +231,8 @@ struct llama_layer_nextn {
     struct ggml_tensor * shared_head_head      = nullptr;
     struct ggml_tensor * shared_head_head_s    = nullptr;
     struct ggml_tensor * shared_head_head_in_s = nullptr;
+    struct ggml_tensor * draft_head            = nullptr; // [n_embd, n_sub]: draft-only LM head over a vocabulary subset
+    struct ggml_tensor * draft_vocab           = nullptr; // I32 [n_sub]: the token id of each draft_head row
     struct ggml_tensor * shared_head_norm      = nullptr;
 
     struct ggml_tensor * hc_head_norm          = nullptr;
